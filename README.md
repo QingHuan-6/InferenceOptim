@@ -12,6 +12,136 @@
 日常通过 GitHub 私有仓库同步；分支、AI 提交边界与服务器更新流程见
 [GitHub 与 AI Git 规范](docs/git_workflow.md)。
 
+首次部署按以下顺序操作：
+[环境配置](#服务器环境配置) → [模型下载](#服务器安装和模型下载) →
+[数据集准备](#数据集下载与输入格式) → [运行实验](#运行真实模型)。
+
+## 服务器环境配置
+
+下面是 Linux 服务器上的真实推理环境；Windows 本地 mock 开发环境见后文。
+**先安装环境，再下载模型和数据。安装脚本不包含模型或数据集下载。**
+
+| 项目 | 本项目初始配置 |
+| --- | --- |
+| 系统 | Linux x86_64，初始建议使用 Ubuntu 22.04/24.04 镜像 |
+| GPU | 单张 NVIDIA RTX 4090，标准 24GB 显存；检查实际设备与可用显存 |
+| Python | 推荐 3.11；固定推理组合限定 3.11–3.13 |
+| PyTorch | 固定 2.9.0，服务器安装 CUDA 12.8 wheel（cu128） |
+| Transformers | 固定 4.57.1 |
+| 精度与设备 | BF16、cuda:0，batch=1；不可用时直接报错，不自动回退 CPU |
+| 推理环境目录 | 项目根目录下 .venv-4090，与平台自带环境隔离 |
+| 开发工具 | inference、dev 两个可选依赖组，具体声明见 pyproject.toml |
+
+这是准备使用的 GPU 环境组合，尚未在你的租用机器验收。
+本地 CPU 功能测试使用 torch 2.9.0+cpu，不能直接复制该环境到 GPU 服务器。
+安装依据见 [PyTorch 官方版本说明](https://pytorch.org/get-started/previous-versions/)。
+
+### 1. 检查机器和 Python
+
+在服务器项目根目录执行：
+
+```bash
+nvidia-smi
+python3 --version
+```
+
+确认设备型号、显存、驱动及 Python 版本。nvidia-smi 显示的 CUDA Version 是驱动支持信息，
+不等于当前 Python 中 PyTorch wheel 使用的 CUDA runtime 版本；安装完成后查看 torch.version.cuda。
+驱动必须兼容 cu128；加载失败时先检查驱动与 wheel，不通过安装 CPU 版 PyTorch绕过。
+这条路线使用预编译 wheel，当前无需编译自定义 CUDA 内核。
+
+如果 Python 已处于 3.11–3.13，直接进行下一步。若平台已提供 Conda，但默认 Python 不合适，
+可以先准备一个 Python 3.11 入口，再用它创建项目的独立 venv：
+
+```bash
+conda create -n ainfer-py311 python=3.11 -y
+conda activate ainfer-py311
+PYTHON_BIN="$(command -v python)" bash scripts/setup_4090.sh
+```
+
+这组命令仅适用于已有且能激活的 Conda；没有 Conda 时，选择带 Python 3.11 的平台镜像，
+或让 PYTHON_BIN 指向已经安装的兼容 Python。不要将上面的 Conda 命令与手动安装重复执行。
+
+### 2. 一键安装环境
+
+默认使用 python3 建立环境；Python 已兼容时执行：
+
+```bash
+bash scripts/setup_4090.sh
+```
+
+指定其他兼容 Python 入口时执行：
+
+```bash
+PYTHON_BIN=/你的Python绝对路径/python bash scripts/setup_4090.sh
+```
+
+脚本会检查机器、创建 .venv-4090、安装 GPU PyTorch 与项目、核对 CUDA/BF16，最后执行 pip check。
+失败后先排查报错，安装成功前不要继续下载模型和运行实验。
+
+### 3. 手动安装方式
+
+下面与脚本是两种安装方式，选择一种即可。先确认 python3 为兼容版本：
+
+```bash
+python3 -m venv .venv-4090
+.venv-4090/bin/python -m pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128
+.venv-4090/bin/python -m pip install -e '.[inference,dev]'
+```
+
+顺序不能颠倒：先显式装 GPU wheel，再安装项目可选依赖。
+使用 -e 是为了让后续 git pull 的源码修改立即生效；依赖变更时仍需重新安装依赖。
+不要上传 Windows 的 .venv，也不要直接覆盖平台镜像自带的 PyTorch。
+
+### 4. 验证环境
+
+安装成功后执行，不需要下载模型：
+
+```bash
+.venv-4090/bin/python - <<'PY'
+import sys
+import torch
+import transformers
+
+print("Python:", sys.version)
+print("PyTorch:", torch.__version__)
+print("Transformers:", transformers.__version__)
+print("PyTorch CUDA runtime:", torch.version.cuda)
+assert torch.cuda.is_available(), "CUDA 不可用，请检查驱动及安装的 wheel"
+with torch.cuda.device(0):
+    print("GPU:", torch.cuda.get_device_name(0))
+    print("Total VRAM GiB:", torch.cuda.get_device_properties(0).total_memory / 2**30)
+    print("BF16:", torch.cuda.is_bf16_supported())
+    assert torch.cuda.is_bf16_supported(), "当前设备不支持配置的 BF16"
+PY
+.venv-4090/bin/python -m pip check
+.venv-4090/bin/python -m ainference_optim --help
+```
+
+应能看到 4090、PyTorch 的 CUDA 12.8 runtime、BF16=True，pip check 无依赖冲突，
+CLI 帮助中有 run、verify、summarize。单纯 import 成功或显示 CPU 版版本号不代表 GPU 环境可用。
+确认后再按下文设置 MODEL_DIR、DATA_DIR 并下载。
+
+### 5. 新终端和常见问题
+
+本文始终使用 .venv-4090/bin/python 等完整相对路径，因此无需 activate。
+如希望直接使用 python、pip、hf，可在每个新终端的项目根目录先执行：
+
+```bash
+source .venv-4090/bin/activate
+```
+
+模型路径等 export 变量仍需在新终端重新设置；activate 不会自动恢复它们。
+
+| 现象 | 处理方向 |
+| --- | --- |
+| Python 版本不符合范围 | 更换兼容 Python 入口或平台镜像，再创建环境 |
+| venv / ensurepip 缺失 | 使用支持 venv 的 Python；Ubuntu 系统 Python 可由管理员补齐对应 python3-venv 包 |
+| torch.cuda.is_available() 为 False | 检查是否装成 CPU wheel、nvidia-smi 是否正常、驱动是否兼容；不要用 CPU 回退冒充验收 |
+| 下载 wheel 或模型失败 | 分别检查 download.pytorch.org、包索引或 huggingface.co 的连通性，保存完整报错 |
+| pip / python 指向平台环境 | 使用本文 .venv-4090/bin/ 下的命令，避免混用环境 |
+| GPU 显存不足 | 用 1.5B、batch=1、短输入先测，检查其他进程占用；不自动改变精度或模型 |
+
 ## 已确定的评价指标
 
 第一阶段主结果为 **平均 TPOT 与解码加速比**，必须同时报告端到端延迟和加速比、TTFT、
