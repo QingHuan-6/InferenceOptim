@@ -1,0 +1,3 @@
+{"id":"chat-001","scenario":"chat","prompt":"请用一句话解释什么是 KV Cache。"}
+{"id":"code-001","scenario":"code","prompt":"用 Python 实现两个整数相加的函数。"}
+{"id":"json-001","scenario":"json","prompt":"返回一个包含 name 和 count 字段的 JSON 对象。"}

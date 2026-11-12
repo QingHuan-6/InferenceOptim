@@ -1,0 +1,24 @@
+# 验证通过后使用；固定输出 128 token，忽略 EOS，仅用于性能测量。
+# 当前输入仍是管线样本，不是按长度分桶的正式数据集。
+[experiment]
+name = "qwen15b-4090-baseline"
+dataset = "../data/smoke.jsonl"
+output_dir = "../outputs"
+warmup = 5
+repeats = 3
+seed = 42
+
+[backend]
+name = "transformers"
+model = "Qwen/Qwen2.5-1.5B-Instruct"
+revision = "main"
+device = "cuda:0"
+dtype = "bfloat16"
+attention = "sdpa"
+chat_template = true
+stop_on_eos = false
+local_files_only = false
+max_input_tokens = 2048
+
+[generation]
+max_new_tokens = 128

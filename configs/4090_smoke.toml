@@ -1,0 +1,24 @@
+# 第一次使用真实 GPU：三个短样本，每条最多生成 32 token，自然遇 EOS 停止。
+[experiment]
+name = "qwen15b-4090-smoke"
+dataset = "../data/smoke.jsonl"
+output_dir = "../outputs"
+warmup = 1
+repeats = 1
+seed = 42
+
+[backend]
+name = "transformers"
+model = "Qwen/Qwen2.5-1.5B-Instruct"
+# 首次解析后，实际 commit 写入 manifest；正式实验请替换为该 commit。
+revision = "main"
+device = "cuda:0"
+dtype = "bfloat16"
+attention = "sdpa"
+chat_template = true
+stop_on_eos = true
+local_files_only = false
+max_input_tokens = 2048
+
+[generation]
+max_new_tokens = 32

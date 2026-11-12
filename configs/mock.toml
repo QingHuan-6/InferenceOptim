@@ -1,0 +1,14 @@
+# 仅用于验证实验管线，所有性能值都是合成数据。
+[experiment]
+name = "mock-smoke"
+dataset = "../data/smoke.jsonl"
+output_dir = "../outputs"
+warmup = 1
+repeats = 2
+seed = 42
+
+[backend]
+name = "mock"
+
+[generation]
+max_new_tokens = 16
