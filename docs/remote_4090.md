@@ -31,6 +31,10 @@ bash scripts/setup_4090.sh
 
 ## 模型缓存与版本
 
+模型下载到指定目录、数据集来源、HumanEval 转换和本机配置生成的完整步骤见
+[README](../README.md)。推荐按 README 生成 configs/local 下的配置并运行。
+以下为原始预设使用 Hub 缓存的替代方案，不自动复用自定义 MODEL_DIR。
+
 模型缓存应放到自己确认可保留的数据盘目录，下面的路径必须替换：
 
 ```bash
