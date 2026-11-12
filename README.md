@@ -12,6 +12,14 @@
 日常通过 GitHub 私有仓库同步；分支、AI 提交边界与服务器更新流程见
 [GitHub 与 AI Git 规范](docs/git_workflow.md)。
 
+## 已确定的评价指标
+
+第一阶段主结果为 **平均 TPOT 与解码加速比**，必须同时报告端到端延迟和加速比、TTFT、
+单请求解码速率、峰值显存及贪心 token 一致性。投机阶段增加接受率、每轮推进 token 数
+和开销分解；并发阶段再评价双 SLO 达标率、服务容量和尾时延。
+定义、聚合方式、任务书目标和实现状态以 [评价指标约定 V1.0](docs/evaluation_metrics.md) 为准。
+P99 请求平均 TPOT 与 P99 逐 token TBT 分开报告，不能互换。
+
 ## 模型和数据集保存位置
 
 | 内容 | 来源 | 位置与状态 |
@@ -225,6 +233,7 @@ configs/                         TOML 实验配置
 data/                            可公开的 JSONL 样本
 docs/engineering.md              代码、类型、注释及扩展规范
 docs/experiment_protocol.md      测量定义与复现约定
+docs/evaluation_metrics.md       已确定的指标、统计口径和验收目标
 src/ainference_optim/
     domain.py                    数据模型与后端协议
     config.py                    配置解析和校验

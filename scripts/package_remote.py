@@ -25,6 +25,7 @@ def main() -> None:
             "docs/git_workflow.md",
             "docs/experiment_protocol.md",
             "docs/benchmark_references.md",
+            "docs/evaluation_metrics.md",
             "data/smoke.jsonl",
             "configs/mock.toml",
             "configs/4090_smoke.toml",
