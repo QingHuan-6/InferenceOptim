@@ -1,6 +1,7 @@
 """负责实验输出的 JSON 序列化与状态记录。"""
 
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -22,3 +23,28 @@ def append_record(path: Path, value: Any) -> None:
     line = json.dumps(value, ensure_ascii=False, allow_nan=False)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(line + "\n")
+
+
+def code_identity() -> dict[str, object]:
+    """记录当前源码提交和未提交状态；Git 不可用时显式保留原因。"""
+    try:
+        root = Path(__file__).resolve().parents[2]
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+        return {"commit": commit, "dirty": bool(status.strip()), "status": status}
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"commit": None, "dirty": None, "unavailable_reason": type(error).__name__}

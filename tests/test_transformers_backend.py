@@ -176,6 +176,74 @@ class TransformersIntegrationTests(unittest.TestCase):
             self.assertGreater(item.generation_elapsed_s, 0)
             self.assertGreaterEqual(item.request_elapsed_s, item.generation_elapsed_s)
 
+    def test_prompt_lookup_uses_assisted_path_and_restores_plain_generation(self) -> None:
+        self.backend._config = replace(self.config, generation_path="hf_generate")
+        request = replace(
+            self.request, prompt=Prompt("repeat", "chat", "hello world hello world hello world")
+        )
+        original = self.backend._model._get_candidate_generator
+        with patch.object(
+            self.backend._model, "_get_candidate_generator", wraps=original
+        ) as assisted:
+            plain = self.backend.lookup_timing(request, 0)
+            lookup = self.backend.lookup_timing(request, 4)
+            self.assertEqual(assisted.call_count, 1)
+            again = self.backend.lookup_timing(request, 0)
+            self.assertEqual(assisted.call_count, 1)
+        self.assertEqual(plain.token_ids, lookup.token_ids)
+        self.assertEqual(plain.token_ids, again.token_ids)
+        self.assertEqual(len(lookup.token_ids), request.max_new_tokens)
+        self.assertIsNone(lookup.peak_memory_bytes)
+        self.assertGreater(lookup.generation_elapsed_s, 0)
+        self.assertNotIn("_get_candidate_generator", self.backend._model.__dict__)
+        for size in (1, 2, 7, 32):
+            with self.subTest(max_new_tokens=size):
+                short = replace(request, max_new_tokens=size)
+                self.assertEqual(
+                    self.backend.lookup_timing(short, 4).token_ids,
+                    self.backend.lookup_timing(short, 0).token_ids,
+                )
+
+    def test_prompt_lookup_factory_is_restored_after_failure(self) -> None:
+        self.backend._config = replace(self.config, generation_path="hf_generate")
+        with (
+            patch.object(self.backend._model, "generate", side_effect=RuntimeError("failure")),
+            self.assertRaisesRegex(RuntimeError, "failure"),
+        ):
+            self.backend.lookup_timing(self.request, 4)
+        self.assertNotIn("_get_candidate_generator", self.backend._model.__dict__)
+
+    def test_prompt_lookup_candidate_and_multitoken_verification(self) -> None:
+        hf_candidates = importlib.import_module("transformers.generation.candidate_generator")
+        torch = self.backend._torch
+        generator = hf_candidates.PromptLookupCandidateGenerator(
+            eos_token_id=torch.tensor([2]),
+            num_output_tokens=4,
+            max_matching_ngram_size=2,
+            max_length=20,
+        )
+        source = torch.tensor([[4, 5, 6, 7, 4, 5]])
+        candidates, _ = generator.get_candidates(source)
+        self.assertEqual(candidates.tolist(), [[4, 5, 6, 7, 4, 5, 6, 7, 4, 5]])
+        self.backend._config = replace(self.config, generation_path="hf_generate")
+        seen = []
+
+        def observe(module, args, kwargs):
+            seen.append(kwargs.get("logits_to_keep"))
+
+        hook = self.backend._model.register_forward_pre_hook(observe, with_kwargs=True)
+        try:
+            self.backend.lookup_timing(
+                replace(
+                    self.request,
+                    prompt=Prompt("lookup", "chat", "hello world assistant hello world"),
+                ),
+                4,
+            )
+        finally:
+            hook.remove()
+        self.assertTrue(any(value > 1 for value in seen))
+
     def test_native_generate_records_only_output_tokens_and_ignores_model_defaults(self) -> None:
         native = TransformersBackend(replace(self.config, generation_path="hf_generate"))
         try:

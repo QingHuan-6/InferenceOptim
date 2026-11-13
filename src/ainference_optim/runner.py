@@ -3,7 +3,6 @@
 import hashlib
 import json
 import platform
-import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import asdict
@@ -17,31 +16,7 @@ from ainference_optim.config import ExperimentConfig
 from ainference_optim.data import parse_prompts
 from ainference_optim.domain import Backend, GenerationRequest, RunProgress
 from ainference_optim.metrics import RequestMetrics, measure, summarize
-from ainference_optim.results import SCHEMA_VERSION, append_record, write_json
-
-
-def _code_identity() -> dict[str, object]:
-    try:
-        root = Path(__file__).resolve().parents[2]
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        ).stdout.strip()
-        status = subprocess.run(
-            ["git", "status", "--porcelain=v1"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        ).stdout
-        return {"commit": commit, "dirty": bool(status.strip()), "status": status}
-    except (OSError, subprocess.SubprocessError) as error:
-        return {"commit": None, "dirty": None, "unavailable_reason": type(error).__name__}
+from ainference_optim.results import SCHEMA_VERSION, append_record, code_identity, write_json
 
 
 def run_experiment(
@@ -104,7 +79,7 @@ def _run(
         "config": snapshot,
         "dataset_sha256": hashlib.sha256(dataset_bytes).hexdigest(),
         "measurement_mode": "serial_single_request",
-        "code": _code_identity(),
+        "code": code_identity(),
     }
     write_json(output / "manifest.json", manifest)
     (output / "dataset.jsonl").write_bytes(dataset_bytes)

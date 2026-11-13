@@ -18,6 +18,7 @@ config + data + domain + metrics + results ← runner
 config + data + domain + metrics + results ← verification
 config + data + domain + results ← diagnostics
 config + data + domain + results ← timing_overhead
+config + data + domain + results ← speculation
 data + results ← preparation
 domain + metrics + results ← comparison
 backends + config + data + runner + verification + diagnostics + timing_overhead + preparation + comparison ← cli

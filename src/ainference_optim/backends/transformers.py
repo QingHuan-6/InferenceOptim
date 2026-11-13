@@ -49,6 +49,21 @@ class _TokenClock:
         self.ended = True
 
 
+class _BoundedLookupCandidates:
+    """仅裁剪候选以给目标模型的额外 token 留位置，验证与缓存仍由 HF 管理。"""
+
+    def __init__(self, delegate: Any, max_length: int) -> None:
+        self._delegate = delegate
+        self._max_length = max_length
+
+    def get_candidates(self, input_ids: Any) -> tuple[Any, Any]:
+        candidates, logits = self._delegate.get_candidates(input_ids)
+        return candidates[:, : self._max_length - 1], logits
+
+    def update_candidate_strategy(self, input_ids: Any, scores: Any, num_matches: Any) -> None:
+        self._delegate.update_candidate_strategy(input_ids, scores, num_matches)
+
+
 def _configure_fp32(torch: ModuleType) -> None:
     torch.backends.cuda.matmul.fp32_precision = "ieee"
     torch.backends.cudnn.fp32_precision = "ieee"
@@ -358,26 +373,62 @@ class TransformersBackend:
         request: GenerationRequest,
         inputs: dict[str, Any],
         streamer: _TokenClock | None = None,
+        draft_tokens: int = 0,
     ) -> Any:
+        # HF 4.57.1 的 PromptLookup 在命中候选时无条件调用 isin(eos)。
+        # 空列表表达“无 EOS 停止”，同时避免 None 导致第三方实现报错。
+        eos_ids = (
+            (self._eos_ids or None) if self._config.stop_on_eos else ([] if draft_tokens else None)
+        )
         generation = self._hf.GenerationConfig(
             max_new_tokens=request.max_new_tokens,
             do_sample=False,
             num_beams=1,
             use_cache=True,
             cache_implementation="dynamic",
-            eos_token_id=(self._eos_ids or None) if self._config.stop_on_eos else None,
-            pad_token_id=self._tokenizer.pad_token_id,
+            prompt_lookup_num_tokens=draft_tokens or None,
+            max_matching_ngram_size=2,
+            eos_token_id=eos_ids,
+            pad_token_id=self._tokenizer.pad_token_id
+            if self._tokenizer.pad_token_id is not None
+            else 0,
             bos_token_id=self._tokenizer.bos_token_id,
         )
         # 显式覆盖 EOS，避免 HF 将模型默认停止条件重新合并进来。
-        return self._model.generate(
-            **inputs,
-            generation_config=generation,
-            use_model_defaults=False,
-            eos_token_id=(self._eos_ids or None) if self._config.stop_on_eos else None,
-            streamer=streamer,
-            **self._forward_options,
-        )
+        with self._bounded_lookup_candidates(
+            int(inputs["input_ids"].shape[-1]) + request.max_new_tokens, draft_tokens > 0
+        ):
+            return self._model.generate(
+                **inputs,
+                generation_config=generation,
+                use_model_defaults=False,
+                eos_token_id=eos_ids,
+                streamer=streamer,
+                **self._forward_options,
+            )
+
+    @contextmanager
+    def _bounded_lookup_candidates(self, max_length: int, enabled: bool) -> Iterator[None]:
+        if not enabled:
+            yield
+            return
+        # HF 4.57.1 没有始终按剩余输出长度裁剪候选，可能越过 max_new_tokens。
+        # 只适配当前后端实例的候选工厂，退出（含异常）后恢复；不改全局第三方类。
+        model = self._model
+        factory = model._get_candidate_generator
+        previous = model.__dict__.get("_get_candidate_generator")
+
+        def bounded(*args: Any, **kwargs: Any) -> _BoundedLookupCandidates:
+            return _BoundedLookupCandidates(factory(*args, **kwargs), max_length)
+
+        model._get_candidate_generator = bounded
+        try:
+            yield
+        finally:
+            if previous is None:
+                del model._get_candidate_generator
+            else:
+                model._get_candidate_generator = previous
 
     def _generate_native(self, request: GenerationRequest) -> GenerationResult:
         self._torch.manual_seed(request.seed)
@@ -412,15 +463,42 @@ class TransformersBackend:
 
         Returns:
             generate 前后同步的墙钟耗时、完整请求耗时和实际输入输出 ID。
-            不测峰值显存，也不从整体时间推算 TTFT、TPOT。
+            CUDA 记录含常驻权重的峰值 allocated 字节，不从整体时间推算 TTFT、TPOT。
 
         Raises:
             ValueError: 输入超长或生成参数非法。
             RuntimeError: 后端关闭或回调输出与实际输出不一致。
         """
+        return self._timed_native(request, streamer, 0)
+
+    def lookup_timing(self, request: GenerationRequest, draft_tokens: int) -> NativeTiming:
+        """使用 HF 4.57.1 的提示查找候选和原生验证，测完整生成。
+
+        Args:
+            request: 输入、输出上限与种子，当前小试验要求固定输出长度。
+            draft_tokens: 0 使用普通贪心路径；1–16 使用内置提示查找，匹配 n-gram 上限为2。
+
+        Returns:
+            同步 generate 墙钟时间及请求时间，CUDA 峰值 allocated 字节含常驻权重。
+            不提供 TTFT、TPOT、接受率，不据此宣称分布等价。
+
+        Raises:
+            ValueError: 草稿长度或生成配置不合法。
+        """
+        if type(draft_tokens) is not int or not 0 <= draft_tokens <= 16:
+            raise ValueError("draft_tokens 必须为0–16的整数")
+        if self._config.generation_path != "hf_generate" or self._config.stop_on_eos:
+            raise ValueError("投机小试验要求固定长度 hf_generate")
+        return self._timed_native(request, False, draft_tokens)
+
+    def _timed_native(
+        self, request: GenerationRequest, streamer: bool, draft_tokens: int
+    ) -> NativeTiming:
         self._ensure_open()
         self._torch.manual_seed(request.seed)
         self._synchronize()
+        if self._device.type == "cuda":
+            self._torch.cuda.reset_peak_memory_stats(self._device)
         started = perf_counter()
         with self._execution_context():
             inputs = self._prepare(request)
@@ -428,7 +506,7 @@ class TransformersBackend:
             clock = _TokenClock(started, prompt_ids) if streamer else None
             self._synchronize()
             generation_started = perf_counter()
-            result = self._native_forward(request, inputs, clock)
+            result = self._native_forward(request, inputs, clock, draft_tokens)
             self._synchronize()
             generation_elapsed = perf_counter() - generation_started
             ids = tuple(int(token) for token in result[0, len(prompt_ids) :].tolist())
@@ -437,7 +515,12 @@ class TransformersBackend:
             self._tokenizer.decode(ids, skip_special_tokens=True)
             self._synchronize()
             elapsed = perf_counter() - started
-        return NativeTiming(generation_elapsed, elapsed, len(prompt_ids), ids)
+        memory = (
+            int(self._torch.cuda.max_memory_allocated(self._device))
+            if self._device.type == "cuda"
+            else None
+        )
+        return NativeTiming(generation_elapsed, elapsed, len(prompt_ids), ids, memory)
 
     def reference_tokens(self, request: GenerationRequest) -> tuple[int, ...]:
         """用独立 GenerationConfig 调用库内 generate，排除模型默认采样与惩罚参数。"""

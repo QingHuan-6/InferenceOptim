@@ -99,6 +99,16 @@ class NativeTiming:
     request_elapsed_s: float
     input_tokens: int
     token_ids: tuple[int, ...]
+    peak_memory_bytes: int | None = None
+
+
+@runtime_checkable
+class LookupTimingBackend(Backend, Protocol):
+    """支持无 streamer 的普通/提示查找投机配对计时。"""
+
+    def lookup_timing(self, request: GenerationRequest, draft_tokens: int) -> NativeTiming:
+        """draft_tokens=0 为普通解码，正整数启用 HF 内置提示查找。"""
+        ...
 
 
 @runtime_checkable
