@@ -11,8 +11,9 @@
 服务器安装、真实模型输出核对及实验步骤见 [4090 运行说明](docs/remote_4090.md)。
 已完成冒烟测试后，按 [第一轮原生生成基线](docs/baseline_round1.md) 准备固定输入并运行正式基线。
 run 默认显示预热和正式请求进度、轮次及预计剩余时间；使用 --quiet 可关闭。
-两组完成后，用同一说明中的 timing-overhead 小规模检查有/无 streamer 的整体计时差异，
-无需重跑整套数据；该诊断不推算无回调模式的 TTFT/TPOT，也不代表算法加速收益。
+两组完成后先分析现有结果；timing-overhead 是按需诊断，不是必跑流程。
+计时与后续算法开发须先阅读 [源码审阅与实验成本约定](docs/source_review.md)，
+不以未证实的开销猜测要求重复付费测试。
 日常通过 GitHub 私有仓库同步；分支、AI 提交边界与服务器更新流程见
 [GitHub 与 AI Git 规范](docs/git_workflow.md)。
 

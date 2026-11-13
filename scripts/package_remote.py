@@ -28,6 +28,7 @@ def main() -> None:
             "docs/benchmark_references.md",
             "docs/evaluation_metrics.md",
             "docs/baseline_round1.md",
+            "docs/source_review.md",
             "data/smoke.jsonl",
             "configs/mock.toml",
             "configs/4090_smoke.toml",
