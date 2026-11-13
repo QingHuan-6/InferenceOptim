@@ -23,6 +23,11 @@ EOS 等特殊 token 是否包含在输出计数中，真实后端必须明确并
 当前 Transformers 后端计入所有生成 token（包含 EOS），每次 argmax 的 item() 隐式同步
 并取得 host token ID 后记录时间；最终文本解码计入 elapsed_s。
 该观测方式包含逐 token 同步开销，不能直接当作设备端 kernel 极限吞吐。
+当前解码路径 prepared_dynamic_cache_v2 显式使用 DynamicCache、cache_position 和模型的
+prepare_inputs_for_generation，对齐参考路径的位置、张量布局及受支持模型的末位 logits 投影。
+该路径会改变旧版执行开销，性能对照必须使用同一实现版本重新测量，不能混用旧版结果。
+CUDA 上通过 PyTorch 2.9 fp32_precision=ieee 关闭 TF32，不再使用弃用的 allow_tf32 API；
+这不将 BF16 模型变为 FP32，也不保证不同 CUDA 执行路径下的 token 必然一致。
 
 ## 指标定义
 
@@ -71,6 +76,9 @@ mock 仍可不提供 token_ids；真实后端返回与时间线等长的实际 I
 
 verify 命令调用参考 generate，独立保存 verification.json，不加入预热或性能汇总。
 它核对所选样本的贪心 token 序列，不核验任务质量或采样分布。
+报告兼容新增 actual_length、reference_length、first_mismatch_index；索引从 0 起，
+完全一致时为 null，长度不同且较短序列为共同前缀时指向首个缺失位置。
+32-token 验证通过不代表 128-token 验证必然通过，晚期分叉仍判为失败，不使用容差放宽。
 synthetic 只表示数据是否由模拟产生：真实计算为 false，设备验收状态另外记录。
 
 ## 后端扩展步骤

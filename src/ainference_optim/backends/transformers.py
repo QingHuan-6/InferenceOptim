@@ -2,12 +2,19 @@
 
 import gc
 import importlib
+import inspect
 import subprocess
 from time import perf_counter
+from types import ModuleType
 from typing import Any
 
 from ainference_optim.config import TransformersConfig
 from ainference_optim.domain import BackendInfo, GenerationRequest, GenerationResult
+
+
+def _configure_fp32(torch: ModuleType) -> None:
+    torch.backends.cuda.matmul.fp32_precision = "ieee"
+    torch.backends.cudnn.fp32_precision = "ieee"
 
 
 def _driver_version() -> str:
@@ -57,8 +64,7 @@ class TransformersBackend:
             with torch.cuda.device(self._device):
                 if config.dtype == "bfloat16" and not torch.cuda.is_bf16_supported():
                     raise RuntimeError("当前设备不支持 BF16；请显式修改 dtype")
-            torch.backends.cuda.matmul.allow_tf32 = False
-            torch.backends.cudnn.allow_tf32 = False
+            _configure_fp32(torch)
         options = {
             "revision": config.revision,
             "local_files_only": config.local_files_only,
@@ -85,6 +91,12 @@ class TransformersBackend:
             .eval()
         )
         self._closed = False
+        # generate 会在受支持模型上只投影末位 hidden state，手写循环须保持相同形状。
+        self._forward_options = (
+            {"logits_to_keep": 1}
+            if "logits_to_keep" in inspect.signature(self._model.forward).parameters
+            else {}
+        )
         eos = self._model.generation_config.eos_token_id
         if eos is None:
             eos = self._tokenizer.eos_token_id
@@ -105,6 +117,10 @@ class TransformersBackend:
             "chat_template": str(config.chat_template),
             "model_type": str(model_config.model_type),
             "validation_status": "requires_reference_verification_on_target_device",
+            "decode_path": "prepared_dynamic_cache_v2",
+            "input_preparation": "model.prepare_inputs_for_generation",
+            "logits_to_keep": str(self._forward_options.get("logits_to_keep", "model_default")),
+            "fp32_matmul_precision": "ieee" if self._device.type == "cuda" else "unchanged",
         }
         if self._device.type == "cuda":
             properties = torch.cuda.get_device_properties(self._device)
@@ -192,16 +208,20 @@ class TransformersBackend:
             input_tokens = int(inputs["input_ids"].shape[-1])
             current = inputs["input_ids"]
             attention = inputs["attention_mask"]
-            cache = None
+            cache = self._hf.DynamicCache(config=self._model.config)
+            cache_position = torch.arange(input_tokens, device=self._device)
             for index in range(request.max_new_tokens):
-                output = self._model(
-                    input_ids=current,
+                # 与参考路径共用输入规范化，显式对齐位置、cache 和张量 stride。
+                model_inputs = self._model.prepare_inputs_for_generation(
+                    current,
                     attention_mask=attention,
                     past_key_values=cache,
+                    cache_position=cache_position,
                     use_cache=True,
-                    return_dict=True,
+                    **self._forward_options,
                 )
-                next_token = output.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                output = self._model(**model_inputs, return_dict=True)
+                next_token = output.logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
                 token = int(next_token.item())
                 times.append(perf_counter() - started)
                 token_ids.append(token)
@@ -215,6 +235,7 @@ class TransformersBackend:
                         raise RuntimeError("模型没有返回 KV Cache，禁止退化为全序列重算")
                     current = next_token
                     attention = torch.cat((attention, attention.new_ones((1, 1))), dim=-1)
+                    cache_position = cache_position[-1:] + 1
             text = str(self._tokenizer.decode(token_ids, skip_special_tokens=True))
             self._synchronize()
             elapsed = perf_counter() - started
@@ -244,6 +265,7 @@ class TransformersBackend:
                 do_sample=False,
                 num_beams=1,
                 use_cache=True,
+                cache_implementation="dynamic",
                 eos_token_id=(self._eos_ids or None) if self._config.stop_on_eos else None,
                 pad_token_id=self._tokenizer.pad_token_id,
                 bos_token_id=self._tokenizer.bos_token_id,
@@ -254,6 +276,7 @@ class TransformersBackend:
                 generation_config=generation,
                 use_model_defaults=False,
                 eos_token_id=(self._eos_ids or None) if self._config.stop_on_eos else None,
+                **self._forward_options,
             )
             return tuple(int(token) for token in result[0, length:].tolist())
 

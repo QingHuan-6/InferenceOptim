@@ -10,7 +10,7 @@ from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 
-from ainference_optim.backends.transformers import TransformersBackend
+from ainference_optim.backends.transformers import TransformersBackend, _configure_fp32
 from ainference_optim.cli import main
 from ainference_optim.config import TransformersConfig
 from ainference_optim.domain import GenerationRequest, Prompt
@@ -65,7 +65,7 @@ class TransformersIntegrationTests(unittest.TestCase):
                 num_hidden_layers=2,
                 num_attention_heads=2,
                 num_key_value_heads=1,
-                max_position_embeddings=64,
+                max_position_embeddings=256,
                 bos_token_id=1,
                 eos_token_id=2,
                 pad_token_id=0,
@@ -119,6 +119,55 @@ class TransformersIntegrationTests(unittest.TestCase):
             hook.remove()
         self.assertEqual(lengths, [4] + [1] * 7)
 
+    def test_long_fixed_output_matches_reference(self) -> None:
+        request = replace(self.request, max_new_tokens=128)
+        result = self.backend.generate(request)
+        self.assertEqual(len(result.token_ids), 128)
+        self.assertEqual(result.token_ids, self.backend.reference_tokens(request))
+
+    def test_forward_positions_and_last_logits_match_reference(self) -> None:
+        observations = []
+
+        def observe(module, args, kwargs):
+            observations.append(
+                {
+                    "ids": kwargs["input_ids"].tolist(),
+                    "mask": kwargs["attention_mask"].tolist(),
+                    "position": kwargs["position_ids"].tolist(),
+                    "cache_position": kwargs["cache_position"].tolist(),
+                    "logits_to_keep": kwargs["logits_to_keep"],
+                    "cache_type": type(kwargs["past_key_values"]).__name__,
+                }
+            )
+
+        hook = self.backend._model.register_forward_pre_hook(observe, with_kwargs=True)
+        try:
+            self.backend.generate(self.request)
+            actual = observations.copy()
+            observations.clear()
+            self.backend.reference_tokens(self.request)
+        finally:
+            hook.remove()
+        self.assertEqual(actual, observations)
+        self.assertTrue(all(item["logits_to_keep"] == 1 for item in actual))
+
+    def test_new_tf32_api_does_not_emit_deprecation_warning(self) -> None:
+        import warnings
+
+        torch = importlib.import_module("torch")
+        matmul = torch.backends.cuda.matmul
+        cudnn = torch.backends.cudnn
+        previous = (matmul.fp32_precision, cudnn.fp32_precision)
+        try:
+            with warnings.catch_warnings(record=True) as seen:
+                warnings.simplefilter("always")
+                _configure_fp32(torch)
+            self.assertEqual(matmul.fp32_precision, "ieee")
+            self.assertEqual(cudnn.fp32_precision, "ieee")
+            self.assertFalse(any("allow_tf32" in str(warning.message) for warning in seen))
+        finally:
+            matmul.fp32_precision, cudnn.fp32_precision = previous
+
     def test_eos_stops_and_is_included_in_output(self) -> None:
         first = self.backend.generate(self.request).token_ids[0]
         self.backend._eos_ids = [first, 2]
@@ -143,7 +192,7 @@ class TransformersIntegrationTests(unittest.TestCase):
             self.backend.generate(self.request)
         self.backend._config = self.config
         with self.assertRaisesRegex(ValueError, "上下文上限"):
-            self.backend.generate(replace(self.request, max_new_tokens=64))
+            self.backend.generate(replace(self.request, max_new_tokens=256))
 
     def test_close_is_idempotent_and_prevents_reuse(self) -> None:
         self.backend.close()

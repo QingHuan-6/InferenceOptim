@@ -66,6 +66,19 @@ verification.json。退出码 0 表示所选样本全部一致，2 表示存在�
 失败时停止性能实验，先定位原因。验证只覆盖所选贪心请求，不证明采样分布等价。
 比较采用独立 GenerationConfig，关闭采样、惩罚和强制 token 等默认生成策略。
 
+### 短输出通过而长输出失败
+
+smoke 最多检查 32 token，baseline 检查 128 token；后续位置发生分叉时，两者可以分别通过和失败。
+不要把晚期不一致自动判成可忽略的 BF16 误差，更不能直接开始正式性能对照。
+查看 verification.json 中每条请求的 actual/reference、长度和 first_mismatch_index（从 0 起），
+并保留模型来源、torch/transformers 版本、精度和 attention 设置。
+TF32 旧接口警告与 token 不一致是不同问题，去掉警告本身不证明正确性已恢复。
+
+当前修订对齐了手写与参考路径的输入准备、DynamicCache 和末位 logits 投影，并替换 TF32 API。
+CPU 随机小模型的 128-token 检查不能代替目标机器验收；需要用原 BF16/SDPA 配置重新 verify。
+若仍不一致，再用独立配置作 eager attention 或 FP32 的定位对照，保留所有报告；
+不得修改原报告、删除失败样本或用不同精度结果宣称原 BF16 配置通过。
+
 ## 冒烟与初步基线
 
 ```bash

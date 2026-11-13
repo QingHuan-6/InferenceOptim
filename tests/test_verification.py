@@ -45,6 +45,10 @@ class VerificationTests(unittest.TestCase):
                 self.assertEqual(passed, match)
                 self.assertEqual(report["passed"], match)
                 self.assertEqual(len(report["requests"]), 2)
+                first = report["requests"][0]
+                self.assertEqual(first["first_mismatch_index"], None if match else 0)
+                self.assertEqual(first["actual_length"], config.max_new_tokens)
+                self.assertEqual(first["reference_length"], config.max_new_tokens if match else 1)
                 self.assertEqual(report["status"], "completed")
                 self.assertTrue(backend.closed)
 
@@ -60,6 +64,33 @@ class VerificationTests(unittest.TestCase):
             self.assertFalse(report["passed"])
             self.assertEqual(report["status"], "failed")
             self.assertTrue(backend.closed)
+
+    def test_late_and_length_only_mismatches_remain_failures(self) -> None:
+        class LateDifference(ReferenceFixture):
+            def __init__(self, position: int, truncate: bool) -> None:
+                super().__init__()
+                self.position = position
+                self.truncate = truncate
+
+            def reference_tokens(self, request: GenerationRequest) -> tuple[int, ...]:
+                tokens = list(super().reference_tokens(request))
+                if self.truncate:
+                    return tuple(tokens[: self.position])
+                tokens[self.position] = 999
+                return tuple(tokens)
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = replace(
+                load_config(ROOT / "configs/mock.toml"),
+                output_dir=Path(directory),
+                max_new_tokens=128,
+            )
+            for position, truncate in ((99, False), (127, False), (99, True)):
+                with self.subTest(position=position, truncate=truncate):
+                    output, passed = verify_backend(config, LateDifference(position, truncate), 1)
+                    report = json.loads((output / "verification.json").read_text(encoding="utf-8"))
+                    self.assertFalse(passed)
+                    self.assertEqual(report["requests"][0]["first_mismatch_index"], position)
 
     def test_cli_import_does_not_load_torch_or_transformers(self) -> None:
         completed = subprocess.run(

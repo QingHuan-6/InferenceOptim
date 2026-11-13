@@ -62,6 +62,16 @@ def verify_backend(
                 if not actual.token_ids or len(actual.token_ids) > config.max_new_tokens:
                     raise ValueError("验证路径必须返回非空、未超出上限的实际 token_ids")
                 reference = backend.reference_tokens(request)
+                first_mismatch = next(
+                    (
+                        position
+                        for position in range(max(len(actual.token_ids), len(reference)))
+                        if position >= len(actual.token_ids)
+                        or position >= len(reference)
+                        or actual.token_ids[position] != reference[position]
+                    ),
+                    None,
+                )
                 rows.append(
                     {
                         "prompt_id": prompt.id,
@@ -69,6 +79,9 @@ def verify_backend(
                         "actual": actual.token_ids,
                         "reference": reference,
                         "match": actual.token_ids == reference,
+                        "actual_length": len(actual.token_ids),
+                        "reference_length": len(reference),
+                        "first_mismatch_index": first_mismatch,
                     }
                 )
             report["passed"] = all(row["match"] for row in rows)
