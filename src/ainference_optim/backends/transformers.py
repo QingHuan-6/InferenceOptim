@@ -13,7 +13,13 @@ from types import ModuleType
 from typing import Any
 
 from ainference_optim.config import TransformersConfig
-from ainference_optim.domain import BackendInfo, GenerationRequest, GenerationResult, LogitProbe
+from ainference_optim.domain import (
+    BackendInfo,
+    GenerationRequest,
+    GenerationResult,
+    LogitProbe,
+    NativeTiming,
+)
 
 
 class _TokenClock:
@@ -396,6 +402,42 @@ class TransformersBackend:
                 else None
             )
         return GenerationResult(text, len(prompt_ids), tuple(clock.times), elapsed, memory, ids)
+
+    def native_timing(self, request: GenerationRequest, streamer: bool) -> NativeTiming:
+        """用相同生成规则观测有/无 streamer 的整体耗时，不返回虚构时间线。
+
+        Args:
+            request: 同一配对实验的输入、输出上限与种子。
+            streamer: 是否启用与正式原生基线相同的逐 token 回调。
+
+        Returns:
+            generate 前后同步的墙钟耗时、完整请求耗时和实际输入输出 ID。
+            不测峰值显存，也不从整体时间推算 TTFT、TPOT。
+
+        Raises:
+            ValueError: 输入超长或生成参数非法。
+            RuntimeError: 后端关闭或回调输出与实际输出不一致。
+        """
+        self._ensure_open()
+        self._torch.manual_seed(request.seed)
+        self._synchronize()
+        started = perf_counter()
+        with self._execution_context():
+            inputs = self._prepare(request)
+            prompt_ids = tuple(int(token) for token in inputs["input_ids"][0].tolist())
+            clock = _TokenClock(started, prompt_ids) if streamer else None
+            self._synchronize()
+            generation_started = perf_counter()
+            result = self._native_forward(request, inputs, clock)
+            self._synchronize()
+            generation_elapsed = perf_counter() - generation_started
+            ids = tuple(int(token) for token in result[0, len(prompt_ids) :].tolist())
+            if clock is not None and (not clock.ended or tuple(clock.token_ids) != ids):
+                raise RuntimeError("计时探针的 streamer 输出不一致")
+            self._tokenizer.decode(ids, skip_special_tokens=True)
+            self._synchronize()
+            elapsed = perf_counter() - started
+        return NativeTiming(generation_elapsed, elapsed, len(prompt_ids), ids)
 
     def reference_tokens(self, request: GenerationRequest) -> tuple[int, ...]:
         """用独立 GenerationConfig 调用库内 generate，排除模型默认采样与惩罚参数。"""

@@ -14,6 +14,7 @@ from ainference_optim.diagnostics import diagnose_backend
 from ainference_optim.domain import RunProgress
 from ainference_optim.preparation import prepare_baseline_data
 from ainference_optim.runner import run_experiment
+from ainference_optim.timing_overhead import measure_timing_overhead
 from ainference_optim.verification import verify_backend
 
 
@@ -43,6 +44,14 @@ def main(argv: list[str] | None = None) -> int:
     run = commands.add_parser("run", help="运行串行实验")
     run.add_argument("--config", type=Path, required=True)
     run.add_argument("--quiet", action="store_true", help="关闭模型加载提示和逐请求进度")
+    overhead = commands.add_parser(
+        "timing-overhead", help="交错比较原生生成有/无逐 token 回调的耗时"
+    )
+    overhead.add_argument("--config", type=Path, required=True)
+    overhead.add_argument("--samples", type=int, default=10)
+    overhead.add_argument("--repeats", type=int, default=3)
+    overhead.add_argument("--warmup", type=int, default=2, help="每种模式的预热次数")
+    overhead.add_argument("--quiet", action="store_true")
     verify = commands.add_parser("verify", help="核对普通解码与参考 generate 的输出 token")
     verify.add_argument("--config", type=Path, required=True)
     verify.add_argument("--samples", type=int, default=3)
@@ -81,10 +90,19 @@ def main(argv: list[str] | None = None) -> int:
                 print("注意：这是合成计时对比，不代表真实性能。")
             print(json.dumps(summary["by_scenario"], ensure_ascii=False, indent=2))
             return 0
-        if args.command in {"run", "verify", "diagnose"}:
+        if args.command in {"run", "verify", "diagnose", "timing-overhead"}:
             if args.command == "verify" and (args.samples < 1 or args.repeats < 1):
                 raise ValueError("--samples 和 --repeats 必须大于零")
             config = load_config(args.config)
+            if args.command == "timing-overhead" and (
+                args.samples < 1
+                or args.repeats < 2
+                or args.warmup < 1
+                or config.transformers is None
+                or config.transformers.stop_on_eos
+                or config.transformers.generation_path != "hf_generate"
+            ):
+                raise ValueError("计时对照要求固定长度 hf_generate，samples≥1、repeats≥2、warmup≥1")
             if args.command == "diagnose":
                 if args.repeats < 2 or config.transformers is None:
                     raise ValueError("diagnose 要求真实模型配置和 --repeats≥2")
@@ -96,11 +114,25 @@ def main(argv: list[str] | None = None) -> int:
                     )
             # 在加载权重或占用 GPU 之前发现数据集格式错误。
             load_prompts(config.dataset)
-            show_progress = args.command == "run" and not args.quiet
+            show_progress = args.command in {"run", "timing-overhead"} and not args.quiet
             if show_progress:
                 print("正在加载后端/模型，加载耗时不计入请求测量……", file=sys.stderr, flush=True)
             backend = create_backend(config.backend, config.transformers)
-            if args.command == "diagnose":
+            if args.command == "timing-overhead":
+                output = measure_timing_overhead(
+                    config,
+                    backend,
+                    args.samples,
+                    args.repeats,
+                    args.warmup,
+                    _print_progress if show_progress else None,
+                )
+                print(f"观测开销报告：{output}")
+                result = json.loads((output / "overhead.json").read_text(encoding="utf-8"))
+                if result["backend"]["synthetic"]:
+                    print("注意：合成计时，仅验证流程，不代表 GPU 性能。")
+                print(json.dumps(result["summary"], ensure_ascii=False, indent=2))
+            elif args.command == "diagnose":
                 output = diagnose_backend(config, backend, args.report, args.repeats)
                 print(f"诊断报告：{output}；探针完成不等于验证通过")
                 diagnostic = json.loads((output / "diagnostics.json").read_text(encoding="utf-8"))

@@ -91,6 +91,42 @@ manifest 自动保存 Git commit/dirty/status；无 Git 环境时写 null 及原
 
 ## 后续配对比较
 
+两组基线完成后，先用小规模计时开销检查，区分原生执行与逐 token 观测成本：
+
+```bash
+.venv-4090/bin/python -m ainference_optim timing-overhead \
+  --config configs/4090_hf_alpaca.toml --samples 10 --repeats 3
+.venv-4090/bin/python -m ainference_optim timing-overhead \
+  --config configs/4090_hf_humaneval.toml --samples 10 --repeats 3
+```
+
+每条命令只加载一次模型，使用原数据前10条，每条3对正式测量（每对分别有/无 streamer），
+共60次正式生成；另有默认2对预热。进度的30/30表示配对数，不是单次生成数。
+同一对使用同一输入、种子、输出长度和生成规则，按样本索引与重复编号交替 AB/BA 顺序。
+预热与正式记录分离。仍有CPU循环、HF实现和驱动开销，无回调不代表最优推理引擎。
+
+独立 outputs/*-overhead-*/overhead.json 保存摘要、配置、后端身份、输入快照哈希和选中ID，
+pairs.jsonl 保存执行顺序、双方原始 token ID 与计时。原来两组基线结果不会被覆盖。
+与性能 run 不同，此诊断暂未自动采集 Git，启动前另存 git rev-parse HEAD 及 git status 记录。
+
+- generation_elapsed_s：对完整 generate 前后做设备同步，单位秒，排除分词和最终文本解码。
+- request_elapsed_s：包括分词、输入传输、生成和最终文本解码，单位秒，排除模型加载。
+- 每项分别报告两种模式的平均值及 streamer/plain 均值之比。
+- streamer_overhead_percent = (streamer均值/plain均值−1)×100，单位%；可能为负，不强行归零。
+- 正式重复数相同，均值等价于先对每题重复求均值，再对题目等权；不对单次比值取平均。
+- token_match_pairs/pair_count 仅描述本次配对是否得到相同输出，不代表通过独立正确性验收。
+
+无回调模式不保存 token 时间线，也不生成 TTFT、TPOT、解码阶段耗时或峰值显存估计。
+其计时边界不同于旧基线，不能把无回调的完整 generate 时间与旧 TPOT 直接相除。
+这里只比较新实验内双方同口径计时；小子集结果不能自动代表整个数据集，且没有置信区间验收。
+若输出不同，保留差异；先检查固定长度、生成设置与运行状态，不能简单将耗时差归因于回调。
+completed只表示诊断完成，不将观测开销下降称为解码算法加速收益。
+
+两种模式差别很小，则不支持“主要被streamer拖慢”的猜测；若差别明显，先调整后续测量模式，
+再用统一模式重测优化方法及相应参照，不把两套计时方式混成加速比。
+
+后续方法对照使用：
+
 ```bash
 .venv-4090/bin/python -m ainference_optim compare \
   outputs/<同一数据集基线目录> outputs/<候选方法目录>

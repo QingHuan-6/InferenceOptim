@@ -92,6 +92,25 @@ class ReferenceBackend(Backend, Protocol):
 
 
 @dataclass(frozen=True)
+class NativeTiming:
+    """原生生成的整体耗时观测；不推算未测得的 TTFT 或逐 token 时间。"""
+
+    generation_elapsed_s: float
+    request_elapsed_s: float
+    input_tokens: int
+    token_ids: tuple[int, ...]
+
+
+@runtime_checkable
+class NativeTimingBackend(Backend, Protocol):
+    """支持切换 streamer 进行同实现计时开销诊断的后端。"""
+
+    def native_timing(self, request: GenerationRequest, streamer: bool) -> NativeTiming:
+        """返回完整 generate 与请求耗时；streamer 仅控制逐 token 观测。"""
+        ...
+
+
+@dataclass(frozen=True)
 class LogitProbe:
     """同一前缀下的一次原始 logits 观测，不作为性能或质量指标。"""
 

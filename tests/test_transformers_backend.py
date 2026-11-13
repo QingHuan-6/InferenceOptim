@@ -156,6 +156,26 @@ class TransformersIntegrationTests(unittest.TestCase):
         self.assertEqual(len(result.token_ids), 128)
         self.assertEqual(result.token_ids, self.backend.reference_tokens(request))
 
+    def test_native_timing_switches_streamer_without_fabricating_token_times(self) -> None:
+        observations = []
+        original = self.backend._model.generate
+
+        def observe(*args, **kwargs):
+            observations.append(kwargs.get("streamer") is not None)
+            return original(*args, **kwargs)
+
+        with patch.object(self.backend._model, "generate", side_effect=observe):
+            plain = self.backend.native_timing(self.request, streamer=False)
+            streamed = self.backend.native_timing(self.request, streamer=True)
+        self.assertEqual(observations, [False, True])
+        self.assertEqual(plain.token_ids, streamed.token_ids)
+        self.assertEqual(len(plain.token_ids), self.request.max_new_tokens)
+        self.assertEqual(plain.input_tokens, streamed.input_tokens)
+        self.assertFalse(hasattr(plain, "token_times_s"))
+        for item in (plain, streamed):
+            self.assertGreater(item.generation_elapsed_s, 0)
+            self.assertGreaterEqual(item.request_elapsed_s, item.generation_elapsed_s)
+
     def test_native_generate_records_only_output_tokens_and_ignores_model_defaults(self) -> None:
         native = TransformersBackend(replace(self.config, generation_path="hf_generate"))
         try:
