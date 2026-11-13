@@ -18,6 +18,7 @@ class RequestMetrics:
     elapsed_s: float
     decode_tokens_per_s: float | None
     peak_memory_bytes: int | None
+    decode_elapsed_s: float | None
 
 
 def measure(result: GenerationResult) -> RequestMetrics:
@@ -60,6 +61,7 @@ def measure(result: GenerationResult) -> RequestMetrics:
         elapsed_s=result.elapsed_s,
         decode_tokens_per_s=1 / tpot if tpot is not None and tpot > 0 else None,
         peak_memory_bytes=memory,
+        decode_elapsed_s=times[-1] - times[0] if len(times) >= 2 else None,
     )
 
 
@@ -79,12 +81,22 @@ def percentile(values: list[float], fraction: float) -> float | None:
 def summarize(rows: list[RequestMetrics]) -> dict[str, object]:
     """聚合请求级指标；不将顺序请求速率解释为并发系统吞吐。"""
     summary: dict[str, object] = {"request_count": len(rows)}
-    for name in ("ttft_s", "tpot_s", "elapsed_s", "decode_tokens_per_s"):
+    for name in ("ttft_s", "tpot_s", "elapsed_s", "decode_tokens_per_s", "decode_elapsed_s"):
         values = [float(value) for row in rows if (value := getattr(row, name)) is not None]
         summary[name] = {
             "valid_count": len(values),
             "mean": sum(values) / len(values) if values else None,
             "p50": percentile(values, 0.5),
             "p99": percentile(values, 0.99),
+        }
+    memory = [row.peak_memory_bytes for row in rows if row.peak_memory_bytes is not None]
+    summary["peak_memory_bytes_max"] = max(memory) if memory else None
+    for name in ("input_tokens", "output_tokens"):
+        counts = [getattr(row, name) for row in rows]
+        summary[name] = {
+            "min": min(counts) if counts else None,
+            "max": max(counts) if counts else None,
+            "mean": sum(counts) / len(counts) if counts else None,
+            "p50": percentile(counts, 0.5),
         }
     return summary

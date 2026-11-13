@@ -17,6 +17,8 @@ models/
 .runtime/
 configs/local/
 data/private/
+data/raw/
+data/baseline-v1/
 /docs/*.docx
 *.pem
 *.key

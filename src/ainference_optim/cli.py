@@ -7,9 +7,11 @@ from dataclasses import replace
 from pathlib import Path
 
 from ainference_optim.backends import create_backend
+from ainference_optim.comparison import compare_runs
 from ainference_optim.config import load_config
 from ainference_optim.data import load_prompts
 from ainference_optim.diagnostics import diagnose_backend
+from ainference_optim.preparation import prepare_baseline_data
 from ainference_optim.runner import run_experiment
 from ainference_optim.verification import verify_backend
 
@@ -31,8 +33,33 @@ def main(argv: list[str] | None = None) -> int:
     diagnose.add_argument("--dtype", choices=("bfloat16", "float32"))
     report = commands.add_parser("summarize", help="查看已完成实验的汇总")
     report.add_argument("run_dir", type=Path)
+    prepare = commands.add_parser(
+        "prepare-baseline", help="从原始 Alpaca/HumanEval 固定抽样性能输入"
+    )
+    prepare.add_argument("--alpaca", type=Path, required=True)
+    prepare.add_argument("--humaneval", type=Path, required=True)
+    prepare.add_argument("--output-dir", type=Path, default=Path("data/baseline-v1"))
+    prepare.add_argument("--seed", type=int, default=42)
+    compare = commands.add_parser("compare", help="校验并配对比较两次固定长度实验")
+    compare.add_argument("baseline", type=Path)
+    compare.add_argument("candidate", type=Path)
+    compare.add_argument("--output-dir", type=Path, default=Path("outputs"))
     args = parser.parse_args(argv)
     try:
+        if args.command == "prepare-baseline":
+            prepared = prepare_baseline_data(
+                args.alpaca, args.humaneval, args.output_dir, args.seed
+            )
+            print(f"输入目录：{prepared}")
+            return 0
+        if args.command == "compare":
+            output = compare_runs(args.baseline, args.candidate, args.output_dir)
+            print(f"对比报告：{output}；仅为计时对比，不代表通过正确性验收")
+            summary = json.loads((output / "comparison.json").read_text(encoding="utf-8"))
+            if summary["synthetic"]:
+                print("注意：这是合成计时对比，不代表真实性能。")
+            print(json.dumps(summary["by_scenario"], ensure_ascii=False, indent=2))
+            return 0
         if args.command in {"run", "verify", "diagnose"}:
             if args.command == "verify" and (args.samples < 1 or args.repeats < 1):
                 raise ValueError("--samples 和 --repeats 必须大于零")

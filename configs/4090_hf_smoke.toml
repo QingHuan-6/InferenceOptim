@@ -1,0 +1,23 @@
+[experiment]
+name = "qwen15b-4090-hf-smoke"
+dataset = "../data/smoke.jsonl"
+output_dir = "../outputs"
+warmup = 1
+repeats = 1
+seed = 42
+
+[backend]
+name = "transformers"
+model = "../models/Qwen2.5-1.5B-Instruct"
+revision = "main"
+device = "cuda:0"
+dtype = "bfloat16"
+attention = "sdpa"
+generation_path = "hf_generate"
+chat_template = true
+stop_on_eos = false
+local_files_only = true
+max_input_tokens = 4096
+
+[generation]
+max_new_tokens = 32

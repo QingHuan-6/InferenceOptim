@@ -16,6 +16,33 @@ from ainference_optim.config import TransformersConfig
 from ainference_optim.domain import BackendInfo, GenerationRequest, GenerationResult, LogitProbe
 
 
+class _TokenClock:
+    """只接收 token ID 的同步 streamer，跳过 HF 首次发送的输入提示。"""
+
+    def __init__(self, started: float, prompt_ids: tuple[int, ...]) -> None:
+        self.started = started
+        self.prompt_ids = prompt_ids
+        self.received_prompt = False
+        self.ended = False
+        self.token_ids: list[int] = []
+        self.times: list[float] = []
+
+    def put(self, value: Any) -> None:
+        """在 token 已到达 CPU 后记录可用时间；同批释放共享时间戳。"""
+        tokens = tuple(int(token) for token in value.reshape(-1).tolist())
+        if not self.received_prompt:
+            if tokens != self.prompt_ids:
+                raise RuntimeError("HF streamer 首次发送的提示与实际输入不一致")
+            self.received_prompt = True
+            return
+        self.token_ids.extend(tokens)
+        self.times.extend([perf_counter() - self.started] * len(tokens))
+
+    def end(self) -> None:
+        """记录 HF 已完成发送；不做额外分词或文本流式解码。"""
+        self.ended = True
+
+
 def _configure_fp32(torch: ModuleType) -> None:
     torch.backends.cuda.matmul.fp32_precision = "ieee"
     torch.backends.cudnn.fp32_precision = "ieee"
@@ -153,7 +180,13 @@ class TransformersBackend:
             "chat_template": str(config.chat_template),
             "model_type": str(model_config.model_type),
             "validation_status": "requires_reference_verification_on_target_device",
-            "decode_path": "prepared_dynamic_cache_v2",
+            "decode_path": (
+                "hf_generate_streamer_v1"
+                if config.generation_path == "hf_generate"
+                else "prepared_dynamic_cache_v2"
+            ),
+            "generation_path": config.generation_path,
+            "token_observation": "host_available_each_token_v1",
             "input_preparation": "model.prepare_inputs_for_generation",
             "logits_to_keep": str(self._forward_options.get("logits_to_keep", "model_default")),
             "fp32_matmul_precision": "ieee" if self._device.type == "cuda" else "unchanged",
@@ -186,7 +219,8 @@ class TransformersBackend:
             synthetic=False,
             timing_notes=(
                 "host perf_counter；含聊天模板、分词、输入传输及最终文本解码；"
-                "每个 argmax token 经 item() 到达 CPU 后计时（包含隐式同步开销）；"
+                "逐 token 到达 CPU 后计时（manual 使用 item，hf_generate 使用 streamer）；"
+                "包含同步与回调开销，不代表无观测的设备极限速度；"
                 "请求前后 CUDA 同步；不含模型加载；EOS 计入输出 token；"
                 "peak_memory_bytes 为请求期间 max_memory_allocated，包含常驻权重"
             ),
@@ -253,6 +287,8 @@ class TransformersBackend:
             RuntimeError: 后端已关闭、设备失败或模型不返回 KV Cache。
         """
         self._ensure_open()
+        if self._config.generation_path == "hf_generate":
+            return self._generate_native(request)
         torch = self._torch
         torch.manual_seed(request.seed)
         self._synchronize()
@@ -311,6 +347,56 @@ class TransformersBackend:
             token_ids=tuple(token_ids),
         )
 
+    def _native_forward(
+        self,
+        request: GenerationRequest,
+        inputs: dict[str, Any],
+        streamer: _TokenClock | None = None,
+    ) -> Any:
+        generation = self._hf.GenerationConfig(
+            max_new_tokens=request.max_new_tokens,
+            do_sample=False,
+            num_beams=1,
+            use_cache=True,
+            cache_implementation="dynamic",
+            eos_token_id=(self._eos_ids or None) if self._config.stop_on_eos else None,
+            pad_token_id=self._tokenizer.pad_token_id,
+            bos_token_id=self._tokenizer.bos_token_id,
+        )
+        # 显式覆盖 EOS，避免 HF 将模型默认停止条件重新合并进来。
+        return self._model.generate(
+            **inputs,
+            generation_config=generation,
+            use_model_defaults=False,
+            eos_token_id=(self._eos_ids or None) if self._config.stop_on_eos else None,
+            streamer=streamer,
+            **self._forward_options,
+        )
+
+    def _generate_native(self, request: GenerationRequest) -> GenerationResult:
+        self._torch.manual_seed(request.seed)
+        self._synchronize()
+        if self._device.type == "cuda":
+            self._torch.cuda.reset_peak_memory_stats(self._device)
+        started = perf_counter()
+        with self._execution_context():
+            inputs = self._prepare(request)
+            prompt_ids = tuple(int(token) for token in inputs["input_ids"][0].tolist())
+            clock = _TokenClock(started, prompt_ids)
+            result = self._native_forward(request, inputs, clock)
+            ids = tuple(int(token) for token in result[0, len(prompt_ids) :].tolist())
+            if not clock.ended or tuple(clock.token_ids) != ids:
+                raise RuntimeError("HF streamer 时间线与最终输出 token 不一致")
+            text = str(self._tokenizer.decode(ids, skip_special_tokens=True))
+            self._synchronize()
+            elapsed = perf_counter() - started
+            memory = (
+                int(self._torch.cuda.max_memory_allocated(self._device))
+                if self._device.type == "cuda"
+                else None
+            )
+        return GenerationResult(text, len(prompt_ids), tuple(clock.times), elapsed, memory, ids)
+
     def reference_tokens(self, request: GenerationRequest) -> tuple[int, ...]:
         """用独立 GenerationConfig 调用库内 generate，排除模型默认采样与惩罚参数。"""
         self._ensure_open()
@@ -318,24 +404,7 @@ class TransformersBackend:
         with self._execution_context():
             inputs = self._prepare(request)
             length = int(inputs["input_ids"].shape[-1])
-            generation = self._hf.GenerationConfig(
-                max_new_tokens=request.max_new_tokens,
-                do_sample=False,
-                num_beams=1,
-                use_cache=True,
-                cache_implementation="dynamic",
-                eos_token_id=(self._eos_ids or None) if self._config.stop_on_eos else None,
-                pad_token_id=self._tokenizer.pad_token_id,
-                bos_token_id=self._tokenizer.bos_token_id,
-            )
-            # EOS=None 在模型默认值合并时仍可能被补回，必须在最终 kwargs 中显式覆盖。
-            result = self._model.generate(
-                **inputs,
-                generation_config=generation,
-                use_model_defaults=False,
-                eos_token_id=(self._eos_ids or None) if self._config.stop_on_eos else None,
-                **self._forward_options,
-            )
+            result = self._native_forward(request, inputs)
             return tuple(int(token) for token in result[0, length:].tolist())
 
     def _probe_forward(self, inputs: dict[str, Any], prefix: Any, cached: bool) -> Any:

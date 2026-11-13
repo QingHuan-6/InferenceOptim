@@ -1,7 +1,8 @@
 # 解码性能评测的论文依据
 
 本记录核对论文正文中的数据集、工作负载与指标，不以博客或开源框架现有默认配置替代论文。
-调研日期为 2026-11-12。下列论文发表于 SOSP、OSDI、ASPLOS；这些会议属于 CCF A 类，
+系统论文调研日期为 2026-11-12，DeepSeek 指标补充日期为 2026-11-13。
+首表论文发表于 SOSP、OSDI、ASPLOS；这些会议属于 CCF A 类，
 分类入口见 [CCF 目录](https://www.ccf.org.cn/Academic_Evaluation/By_category/)，
 可交叉查阅 [北大 CECA 的 CCF 分类对照](https://ceca.pku.edu.cn/research/topconf/index.htm)。
 
@@ -44,6 +45,29 @@ Sarathi-Serve 的 P99 TBT 是连续输出 token 间隔的尾部统计，
    不等于标准 pass@k 评测；当前项目没有执行其测试代码或实现该评分。
 5. JSON/工具调用需另外选择有依据的数据集与评分规则；不能用上述论文的数据集
    推导“JSON 场景已覆盖”。当前只有自带 JSON 提示用于流程检查。
+
+## DeepSeek 解码指标补充
+
+以下区分方法论文、模型技术报告和官方工程文档；不统一标为 CCF A 论文。
+这些资料支持指标选择，不代表本项目复现了相应集群或收益。
+
+| 资料 | 与指标有关的原文定位 | 本项目采用的边界 |
+| --- | --- | --- |
+| [DeepSeek-V2](https://arxiv.org/html/2405.04434v5)（2024） | §3.4，8×H800、实际服务长度分布；报告系统生成吞吐与 KV cache | 总吞吐不是单请求速度，跨模型的吞吐增益不是固定模型的算法加速比 |
+| [DeepSeek-V3](https://arxiv.org/html/2412.19437v2)（2024） | §5.4.3，MTP 第二预测 token 接受率 85%–90%，TPS 为 1.8× | 接受率和真实速度同时记录；该小节未给出完整测量协议，不直接沿用其倍率 |
+| [Insights into DeepSeek-V3](https://arxiv.org/html/2505.09343v1#S2.SS3)（2025） | §2.3，区分系统最大吞吐、单请求延迟，讨论 MTP 及计算通信重叠 | 单请求和服务并发分阶段测量 |
+| [Native Sparse Attention](https://arxiv.org/html/2502.11089v1#S5)（2025） | §5、表4，算子计时与解码 KV 访存量；11.6× 为 64K 条件下访存量推算 | 算子收益、估计收益和整个模型实测分别标注 |
+| [DeepSeek-V3.2](https://arxiv.org/html/2512.02556v1#S2.SS3)（2025） | §2.3、图3，H800 实际服务基准，按每 GPU 小时 2 美元折算 token 成本 | 若扩展成本指标，记录卡数、计费单价、时间边界及实际输出，不使用 API 价格冒充硬件成本 |
+| [DSpark](https://arxiv.org/html/2607.05147v1)（2026） | §4.1、表1：温度1、数学/代码/聊天负载，每轮接受长度；§5.4、图7：总吞吐与单用户速度 | 默认接受长度含 bonus；本项目草稿接受率排除 bonus，每轮推进包含 bonus；接受长度不能替代真实计时 |
+| [DeepInfer benchmark 文档](https://github.com/deepseek-ai/DeepInfer/blob/main/examples/README.md#benchmark) | 稳态 SPS、token/s/GPU、预热/取样窗口；decode 吞吐按 full-acceptance accounting 计算 | 该微基准计数假设草稿全接受；本项目正式有效速度只使用实际输出 |
+
+DSpark 离线负载包括 GSM8K、MATH500、AIME25、MBPP、HumanEval、LiveCodeBench、
+MT-Bench、Alpaca 和 Arena-Hard。其使用真实任务输入测接受长度，不代表每个速度表都报告任务分数。
+线上报告来自实际用户流量；不能把线上流量实验误写成某个公开数据集的复现。
+
+当前单卡采用解码耗时、加速比和实际 token/s 为性能主线，TTFT、TPOT、E2E 与显存并列，
+后续投机后端补充接受率、每轮推进与耗时分解；GSM8K/HumanEval 用于独立质量评测。
+这套组合是本项目的实验设计，不声称 DeepSeek 所有文章都使用同一套指标。
 
 ## 数据来源与版本
 

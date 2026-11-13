@@ -156,6 +156,29 @@ class TransformersIntegrationTests(unittest.TestCase):
         self.assertEqual(len(result.token_ids), 128)
         self.assertEqual(result.token_ids, self.backend.reference_tokens(request))
 
+    def test_native_generate_records_only_output_tokens_and_ignores_model_defaults(self) -> None:
+        native = TransformersBackend(replace(self.config, generation_path="hf_generate"))
+        try:
+            request = replace(self.request, max_new_tokens=128)
+            expected = native.reference_tokens(request)
+            native._model.generation_config.do_sample = True
+            native._model.generation_config.repetition_penalty = 2.0
+            native._model.generation_config.eos_token_id = expected[0]
+            result = native.generate(request)
+            self.assertEqual(result.token_ids, expected)
+            self.assertEqual(len(result.token_times_s), 128)
+            self.assertEqual(result.input_tokens, 4)
+            self.assertGreater(measure(result).decode_elapsed_s, 0)
+            self.assertEqual(native.info.metadata["decode_path"], "hf_generate_streamer_v1")
+            native._eos_ids = [expected[0]]
+            native._config = replace(native._config, stop_on_eos=True)
+            eos = native.generate(request)
+            self.assertEqual(eos.token_ids, (expected[0],))
+            self.assertEqual(len(eos.token_times_s), 1)
+            self.assertIsNone(measure(eos).decode_elapsed_s)
+        finally:
+            native.close()
+
     def test_fixed_prefix_probes_are_repeatable_and_do_not_change_generation(self) -> None:
         expected = self.backend.generate(self.request).token_ids
         for prefix in ((), expected[:4]):
@@ -307,6 +330,7 @@ class TransformersIntegrationTests(unittest.TestCase):
                 'output_dir = "../outputs"': 'output_dir = "./outputs"',
                 'device = "cuda:0"': 'device = "cpu"',
                 'dtype = "bfloat16"': 'dtype = "float32"',
+                'attention = "sdpa"': 'attention = "sdpa"\ngeneration_path = "hf_generate"',
                 "stop_on_eos = true": "stop_on_eos = false",
                 "local_files_only = false": "local_files_only = true",
                 "max_new_tokens = 32": "max_new_tokens = 8",

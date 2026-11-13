@@ -22,6 +22,7 @@ class TransformersConfig:
     max_input_tokens: int = 2048
     deterministic: bool = False
     sdpa_backend: str = "auto"
+    generation_path: str = "manual"
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ def _transformers_config(raw: dict[str, Any], base: Path) -> TransformersConfig:
         "max_input_tokens",
         "deterministic",
         "sdpa_backend",
+        "generation_path",
     }
     if set(raw) - allowed or "model" not in raw:
         raise ValueError("transformers 后端必须指定 model，且不能有未知字段")
@@ -87,6 +89,9 @@ def _transformers_config(raw: dict[str, Any], base: Path) -> TransformersConfig:
     dtype = _string(raw.get("dtype", "bfloat16"), "backend.dtype")
     attention = _string(raw.get("attention", "sdpa"), "backend.attention")
     sdpa_backend = _string(raw.get("sdpa_backend", "auto"), "backend.sdpa_backend")
+    generation_path = _string(raw.get("generation_path", "manual"), "backend.generation_path")
+    if generation_path not in {"manual", "hf_generate"}:
+        raise ValueError("generation_path 仅支持 manual 或 hf_generate")
     if device != "cpu" and not re.fullmatch(r"cuda:[0-9]+", device):
         raise ValueError("device 仅支持 cpu 或 cuda:<非负索引>，不支持自动分配")
     if dtype not in {"float32", "float16", "bfloat16"}:
@@ -109,6 +114,7 @@ def _transformers_config(raw: dict[str, Any], base: Path) -> TransformersConfig:
         max_input_tokens=_integer(raw.get("max_input_tokens", 2048), "max_input_tokens", 1),
         deterministic=_boolean(raw.get("deterministic", False), "deterministic"),
         sdpa_backend=sdpa_backend,
+        generation_path=generation_path,
     )
 
 

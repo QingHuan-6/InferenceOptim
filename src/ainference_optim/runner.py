@@ -1,7 +1,9 @@
 """编排串行实验，不承载模型计算或设备逻辑。"""
 
 import hashlib
+import json
 import platform
+import subprocess
 import sys
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -14,6 +16,30 @@ from ainference_optim.data import parse_prompts
 from ainference_optim.domain import Backend, GenerationRequest
 from ainference_optim.metrics import RequestMetrics, measure, summarize
 from ainference_optim.results import SCHEMA_VERSION, append_record, write_json
+
+
+def _code_identity() -> dict[str, object]:
+    try:
+        root = Path(__file__).resolve().parents[2]
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+        return {"commit": commit, "dirty": bool(status.strip()), "status": status}
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"commit": None, "dirty": None, "unavailable_reason": type(error).__name__}
 
 
 def run_experiment(config: ExperimentConfig, backend: Backend) -> Path:
@@ -39,6 +65,18 @@ def _run(config: ExperimentConfig, backend: Backend) -> Path:
     # 同一份字节快照同时用于哈希与执行，避免数据文件修改导致证据不一致。
     dataset_bytes = config.dataset.read_bytes()
     prompts = parse_prompts(dataset_bytes.decode("utf-8-sig"), str(config.dataset))
+    provenance: dict[str, str] = {}
+    for name in ("preparation.json", "download_sources.json"):
+        source = config.dataset.parent / name
+        if source.exists():
+            provenance[name] = source.read_text(encoding="utf-8")
+    if "preparation.json" in provenance:
+        preparation = json.loads(provenance["preparation.json"])
+        if (
+            preparation["selection"][config.dataset.stem]["sha256"]
+            != hashlib.sha256(dataset_bytes).hexdigest()
+        ):
+            raise ValueError("输入快照与 preparation.json 的固定抽样哈希不符")
     started = datetime.now(UTC)
     run_id = f"{started:%Y%m%dT%H%M%S}-{uuid4().hex[:12]}"
     output = config.output_dir / f"{config.name}-{run_id}"
@@ -57,9 +95,12 @@ def _run(config: ExperimentConfig, backend: Backend) -> Path:
         "config": snapshot,
         "dataset_sha256": hashlib.sha256(dataset_bytes).hexdigest(),
         "measurement_mode": "serial_single_request",
+        "code": _code_identity(),
     }
     write_json(output / "manifest.json", manifest)
     (output / "dataset.jsonl").write_bytes(dataset_bytes)
+    for name, content in provenance.items():
+        (output / name).write_text(str(content), encoding="utf-8")
     collected: list[RequestMetrics] = []
     grouped: dict[str, list[RequestMetrics]] = {}
     call_index = 0

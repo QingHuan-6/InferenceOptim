@@ -1,0 +1,24 @@
+# 代码提示性能负载，不执行 HumanEval 质量评分。
+[experiment]
+name = "qwen15b-4090-hf-humaneval"
+dataset = "../data/baseline-v1/humaneval.jsonl"
+output_dir = "../outputs"
+warmup = 5
+repeats = 3
+seed = 42
+
+[backend]
+name = "transformers"
+model = "../models/Qwen2.5-1.5B-Instruct"
+revision = "main"
+device = "cuda:0"
+dtype = "bfloat16"
+attention = "sdpa"
+generation_path = "hf_generate"
+chat_template = true
+stop_on_eos = false
+local_files_only = true
+max_input_tokens = 4096
+
+[generation]
+max_new_tokens = 128

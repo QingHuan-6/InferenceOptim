@@ -20,17 +20,22 @@ def main() -> None:
             ".editorconfig",
             "scripts/setup_4090.sh",
             "scripts/package_remote.py",
+            "scripts/prepare_baseline.py",
             "docs/remote_4090.md",
             "docs/engineering.md",
             "docs/git_workflow.md",
             "docs/experiment_protocol.md",
             "docs/benchmark_references.md",
             "docs/evaluation_metrics.md",
+            "docs/baseline_round1.md",
             "data/smoke.jsonl",
             "configs/mock.toml",
             "configs/4090_smoke.toml",
             "configs/4090_baseline.toml",
             "configs/4090_deterministic.toml",
+            "configs/4090_hf_smoke.toml",
+            "configs/4090_hf_alpaca.toml",
+            "configs/4090_hf_humaneval.toml",
         )
     ]
     for directory in (root / "src/ainference_optim", root / "tests"):
