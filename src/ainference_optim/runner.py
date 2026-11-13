@@ -5,15 +5,17 @@ import json
 import platform
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter
 from uuid import uuid4
 
 from ainference_optim import __version__
 from ainference_optim.config import ExperimentConfig
 from ainference_optim.data import parse_prompts
-from ainference_optim.domain import Backend, GenerationRequest
+from ainference_optim.domain import Backend, GenerationRequest, RunProgress
 from ainference_optim.metrics import RequestMetrics, measure, summarize
 from ainference_optim.results import SCHEMA_VERSION, append_record, write_json
 
@@ -42,12 +44,17 @@ def _code_identity() -> dict[str, object]:
         return {"commit": None, "dirty": None, "unavailable_reason": type(error).__name__}
 
 
-def run_experiment(config: ExperimentConfig, backend: Backend) -> Path:
+def run_experiment(
+    config: ExperimentConfig,
+    backend: Backend,
+    progress: Callable[[RunProgress], None] | None = None,
+) -> Path:
     """运行预热与正式测量，将成功或失败状态保存到独立目录。
 
     Args:
         config: 已验证的实验配置。
         backend: 已初始化的后端；本函数取得其生命周期管理权。
+        progress: 可选请求间回调；发生在后端计时之外，默认不输出进度。
 
     Returns:
         本次实验输出目录的绝对路径。
@@ -56,12 +63,14 @@ def run_experiment(config: ExperimentConfig, backend: Backend) -> Path:
         Exception: 原样传播加载、生成与写入错误；已开始的实验记录失败状态。
     """
     try:
-        return _run(config, backend)
+        return _run(config, backend, progress)
     finally:
         backend.close()
 
 
-def _run(config: ExperimentConfig, backend: Backend) -> Path:
+def _run(
+    config: ExperimentConfig, backend: Backend, progress: Callable[[RunProgress], None] | None
+) -> Path:
     # 同一份字节快照同时用于哈希与执行，避免数据文件修改导致证据不一致。
     dataset_bytes = config.dataset.read_bytes()
     prompts = parse_prompts(dataset_bytes.decode("utf-8-sig"), str(config.dataset))
@@ -105,6 +114,9 @@ def _run(config: ExperimentConfig, backend: Backend) -> Path:
     grouped: dict[str, list[RequestMetrics]] = {}
     call_index = 0
     try:
+        phase_started = perf_counter()
+        if progress is not None and config.warmup:
+            progress(RunProgress("warmup", 0, config.warmup, None, None, config.repeats, 0.0))
         for index in range(config.warmup):
             request = GenerationRequest(
                 prompts[index % len(prompts)], config.max_new_tokens, config.seed + call_index
@@ -113,6 +125,22 @@ def _run(config: ExperimentConfig, backend: Backend) -> Path:
             if measure(warmup_result).output_tokens > config.max_new_tokens:
                 raise ValueError("预热返回的 token 数量超过 max_new_tokens")
             call_index += 1
+            if progress is not None:
+                progress(
+                    RunProgress(
+                        "warmup",
+                        index + 1,
+                        config.warmup,
+                        request.prompt.id,
+                        None,
+                        config.repeats,
+                        perf_counter() - phase_started,
+                    )
+                )
+        phase_started = perf_counter()
+        total = len(prompts) * config.repeats
+        if progress is not None:
+            progress(RunProgress("measurement", 0, total, None, None, config.repeats, 0.0))
         for repeat in range(config.repeats):
             for prompt in prompts:
                 request = GenerationRequest(prompt, config.max_new_tokens, config.seed + call_index)
@@ -136,6 +164,19 @@ def _run(config: ExperimentConfig, backend: Backend) -> Path:
                 collected.append(metrics)
                 grouped.setdefault(prompt.scenario, []).append(metrics)
                 call_index += 1
+                # 后端已完成计时与设备同步，且记录已落盘，再通知展示层。
+                if progress is not None:
+                    progress(
+                        RunProgress(
+                            "measurement",
+                            len(collected),
+                            total,
+                            prompt.id,
+                            repeat + 1,
+                            config.repeats,
+                            perf_counter() - phase_started,
+                        )
+                    )
         write_json(
             output / "summary.json",
             {

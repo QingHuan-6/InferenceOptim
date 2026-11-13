@@ -1,7 +1,20 @@
 """定义硬件无关的请求、生成结果与后端契约。"""
 
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
+
+
+@dataclass(frozen=True)
+class RunProgress:
+    """请求之间的进度事件；elapsed_s 是阶段墙钟时间，不是模型性能指标。"""
+
+    phase: Literal["warmup", "measurement"]
+    completed: int
+    total: int
+    prompt_id: str | None
+    repeat: int | None
+    repeats: int
+    elapsed_s: float
 
 
 @dataclass(frozen=True)

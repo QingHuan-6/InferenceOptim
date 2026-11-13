@@ -11,9 +11,29 @@ from ainference_optim.comparison import compare_runs
 from ainference_optim.config import load_config
 from ainference_optim.data import load_prompts
 from ainference_optim.diagnostics import diagnose_backend
+from ainference_optim.domain import RunProgress
 from ainference_optim.preparation import prepare_baseline_data
 from ainference_optim.runner import run_experiment
 from ainference_optim.verification import verify_backend
+
+
+def _print_progress(event: RunProgress) -> None:
+    phase = "预热" if event.phase == "warmup" else "正式"
+    percentage = 100 * event.completed / event.total
+    remaining = (
+        f"{event.elapsed_s / event.completed * (event.total - event.completed):.0f}s"
+        if event.completed
+        else "待估算"
+    )
+    details = f" 已完成样本={event.prompt_id}" if event.prompt_id is not None else " 等待首条完成"
+    if event.repeat is not None:
+        details += f" 轮次={event.repeat}/{event.repeats}"
+    print(
+        f"[{phase}] {event.completed}/{event.total} ({percentage:.1f}%)"
+        f" 已用={event.elapsed_s:.0f}s 预计剩余={remaining}{details}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -22,6 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="运行串行实验")
     run.add_argument("--config", type=Path, required=True)
+    run.add_argument("--quiet", action="store_true", help="关闭模型加载提示和逐请求进度")
     verify = commands.add_parser("verify", help="核对普通解码与参考 generate 的输出 token")
     verify.add_argument("--config", type=Path, required=True)
     verify.add_argument("--samples", type=int, default=3)
@@ -75,6 +96,9 @@ def main(argv: list[str] | None = None) -> int:
                     )
             # 在加载权重或占用 GPU 之前发现数据集格式错误。
             load_prompts(config.dataset)
+            show_progress = args.command == "run" and not args.quiet
+            if show_progress:
+                print("正在加载后端/模型，加载耗时不计入请求测量……", file=sys.stderr, flush=True)
             backend = create_backend(config.backend, config.transformers)
             if args.command == "diagnose":
                 output = diagnose_backend(config, backend, args.report, args.repeats)
@@ -92,7 +116,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"验证报告：{output}；token 一致性：{'通过' if passed else '失败'}")
                 return 0 if passed else 2
             else:
-                print(f"结果目录：{run_experiment(config, backend)}")
+                output = run_experiment(config, backend, _print_progress if show_progress else None)
+                print(f"结果目录：{output}")
         else:
             manifest = json.loads((args.run_dir / "manifest.json").read_text(encoding="utf-8"))
             if manifest["status"] != "completed":
