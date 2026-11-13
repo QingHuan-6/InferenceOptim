@@ -3,11 +3,13 @@
 import argparse
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from ainference_optim.backends import create_backend
 from ainference_optim.config import load_config
 from ainference_optim.data import load_prompts
+from ainference_optim.diagnostics import diagnose_backend
 from ainference_optim.runner import run_experiment
 from ainference_optim.verification import verify_backend
 
@@ -22,18 +24,43 @@ def main(argv: list[str] | None = None) -> int:
     verify.add_argument("--config", type=Path, required=True)
     verify.add_argument("--samples", type=int, default=3)
     verify.add_argument("--repeats", type=int, default=1, help="同输入同种子的稳定性重复次数")
+    diagnose = commands.add_parser("diagnose", help="从失败报告的共同前缀重复探查原始 logits")
+    diagnose.add_argument("--config", type=Path, required=True)
+    diagnose.add_argument("--report", type=Path, required=True)
+    diagnose.add_argument("--repeats", type=int, default=3)
+    diagnose.add_argument("--dtype", choices=("bfloat16", "float32"))
     report = commands.add_parser("summarize", help="查看已完成实验的汇总")
     report.add_argument("run_dir", type=Path)
     args = parser.parse_args(argv)
     try:
-        if args.command in {"run", "verify"}:
+        if args.command in {"run", "verify", "diagnose"}:
             if args.command == "verify" and (args.samples < 1 or args.repeats < 1):
                 raise ValueError("--samples 和 --repeats 必须大于零")
             config = load_config(args.config)
+            if args.command == "diagnose":
+                if args.repeats < 2 or config.transformers is None:
+                    raise ValueError("diagnose 要求真实模型配置和 --repeats≥2")
+                if args.dtype is not None:
+                    if config.transformers.device == "cpu" and args.dtype != "float32":
+                        raise ValueError("CPU 诊断只支持 float32")
+                    config = replace(
+                        config, transformers=replace(config.transformers, dtype=args.dtype)
+                    )
             # 在加载权重或占用 GPU 之前发现数据集格式错误。
             load_prompts(config.dataset)
             backend = create_backend(config.backend, config.transformers)
-            if args.command == "verify":
+            if args.command == "diagnose":
+                output = diagnose_backend(config, backend, args.report, args.repeats)
+                print(f"诊断报告：{output}；探针完成不等于验证通过")
+                diagnostic = json.loads((output / "diagnostics.json").read_text(encoding="utf-8"))
+                for item in diagnostic["observations"]:
+                    print(
+                        f"{item['path']} repeat={item['repeat']} finite={item['finite']} "
+                        f"greedy_token={item['greedy_token_id']} margin={item['top_margin']} "
+                        f"equal_to_first={item['equal_to_first']} "
+                        f"max_abs_difference={item['max_abs_difference']}"
+                    )
+            elif args.command == "verify":
                 output, passed = verify_backend(config, backend, args.samples, args.repeats)
                 print(f"验证报告：{output}；token 一致性：{'通过' if passed else '失败'}")
                 return 0 if passed else 2

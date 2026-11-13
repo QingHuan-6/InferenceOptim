@@ -16,7 +16,8 @@ domain ← data
 domain ← metrics
 config + data + domain + metrics + results ← runner
 config + data + domain + metrics + results ← verification
-backends + config + data + runner + verification ← cli
+config + data + domain + results ← diagnostics
+backends + config + data + runner + verification + diagnostics ← cli
 ```
 
 domain 仅使用标准库。runner 只认识 Backend 协议，不识别 CUDA、NPU、模型名称

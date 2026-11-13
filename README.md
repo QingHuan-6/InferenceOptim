@@ -354,6 +354,28 @@ math 内核和严格确定性可能改变速度、内存及输出；诊断通过
 依据：[PyTorch 可复现性](https://docs.pytorch.org/docs/2.9/notes/randomness.html)、
 [SDPA 内核选择](https://docs.pytorch.org/docs/2.9/generated/torch.nn.functional.scaled_dot_product_attention.html)。
 
+## 确定性验证仍失败时
+
+若 `verify --repeats 3` 显示同一路径重复运行也不一致，保留失败报告，
+用固定共同前缀检查首个跨路径分叉处的原始 logits：
+
+```bash
+.venv-4090/bin/python -m ainference_optim diagnose \
+  --config configs/4090_deterministic.toml \
+  --report outputs/<失败验证目录>/verification.json --repeats 3
+```
+
+命令从报告旁的 `dataset.jsonl` 读取原输入并核对哈希，不修改原报告。
+只选择首条跨路径不一致记录，分别重复完整上下文无缓存计算和逐 token KV cache 重放。
+重放始终喂入同一组已保存 token，避免自由生成分叉改变后续输入。
+终端展示 `finite`、`greedy_token`、`margin`、`equal_to_first`、`max_abs_difference`，
+完整 top-5 与哈希保存在新的 `outputs/*-diagnose-*/diagnostics.json`。
+
+若需精度对照，在同一命令末尾加 `--dtype float32`，会新建另一份报告。
+FP32 仅用于定位问题，其结果不能代替 BF16 验收或 BF16 性能基线。
+两种计算路径之间不要求 logits 逐位一致；先查看各路径内部的重复稳定性。
+判读边界见 [实验协议](docs/experiment_protocol.md#固定前缀-logits-诊断)。
+
 ## 本地无 GPU 快速开始
 
 需要 Python 3.11 或以上。mock 核心运行不依赖 PyTorch 或任何第三方包。
@@ -395,6 +417,7 @@ src/ainference_optim/
     results.py                   文件序列化
     runner.py                    实验编排与资源生命周期
     verification.py              与参考生成逐 token 核对，单独保存报告
+    diagnostics.py               从失败报告组织固定前缀 logits 诊断
     cli.py                       命令行装配入口
 tests/                           无 GPU 测试与可选真实库 CPU 集成测试
 outputs/                         自动生成，不纳入版本管理

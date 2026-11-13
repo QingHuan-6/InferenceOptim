@@ -76,3 +76,31 @@ class ReferenceBackend(Backend, Protocol):
     def reference_tokens(self, request: GenerationRequest) -> tuple[int, ...]:
         """返回相同生成设置下参考实现的输出 token，不计入性能实验。"""
         ...
+
+
+@dataclass(frozen=True)
+class LogitProbe:
+    """同一前缀下的一次原始 logits 观测，不作为性能或质量指标。"""
+
+    path: str
+    repeat: int
+    finite: bool
+    nonfinite_count: int
+    top_token_ids: tuple[int, ...]
+    top_logits: tuple[float | None, ...]
+    top_margin: float | None
+    digest: str
+    equal_to_first: bool
+    max_abs_difference: float | None
+    greedy_token_id: int
+
+
+@runtime_checkable
+class LogitProbeBackend(Backend, Protocol):
+    """支持使用固定输出前缀探查原始 logits 的后端。"""
+
+    def probe_logits(
+        self, request: GenerationRequest, prefix: tuple[int, ...], repeats: int
+    ) -> tuple[LogitProbe, ...]:
+        """分别重复无缓存与缓存重放，不使用新生成的 token 更新前缀。"""
+        ...

@@ -156,6 +156,27 @@ class TransformersIntegrationTests(unittest.TestCase):
         self.assertEqual(len(result.token_ids), 128)
         self.assertEqual(result.token_ids, self.backend.reference_tokens(request))
 
+    def test_fixed_prefix_probes_are_repeatable_and_do_not_change_generation(self) -> None:
+        expected = self.backend.generate(self.request).token_ids
+        for prefix in ((), expected[:4]):
+            observations = self.backend.probe_logits(self.request, prefix, repeats=3)
+            self.assertEqual(len(observations), 6)
+            for path in ("full_context_no_cache", "cache_replay"):
+                rows = [item for item in observations if item.path == path]
+                self.assertEqual(len({item.digest for item in rows}), 1)
+                self.assertTrue(all(item.finite and item.equal_to_first for item in rows))
+                self.assertTrue(all(item.max_abs_difference == 0 for item in rows))
+                self.assertTrue(all(item.top_margin >= 0 for item in rows))
+        self.assertEqual(self.backend.generate(self.request).token_ids, expected)
+
+    def test_probe_rejects_invalid_prefix_and_training_mode(self) -> None:
+        for prefix, repeats in (((9,), 3), ((-1,), 3), ((1,) * 8, 3), ((), 1)):
+            with self.assertRaises(ValueError):
+                self.backend.probe_logits(self.request, prefix, repeats)
+        self.backend._model.train()
+        with self.assertRaisesRegex(RuntimeError, "eval"):
+            self.backend.probe_logits(self.request, (), 3)
+
     def test_deterministic_math_repeats_and_restores_runtime_flags(self) -> None:
         torch = importlib.import_module("torch")
         previous = (
@@ -314,6 +335,32 @@ class TransformersIntegrationTests(unittest.TestCase):
             report = json.loads(verification.read_text(encoding="utf-8"))
             self.assertEqual(report["verification_repeats"], 2)
             self.assertEqual(len(report["requests"]), 2)
+            # 构造已知位置的分叉，覆盖 CLI 从原快照到真实库探针的完整装配。
+            report["requests"][0]["match"] = False
+            report["requests"][0]["reference"][3] = (report["requests"][0]["actual"][3] + 1) % 9
+            verification.write_text(json.dumps(report), encoding="utf-8")
+            with redirect_stdout(io.StringIO()) as display:
+                self.assertEqual(
+                    main(
+                        [
+                            "diagnose",
+                            "--config",
+                            str(config_path),
+                            "--report",
+                            str(verification),
+                            "--dtype",
+                            "float32",
+                            "--repeats",
+                            "2",
+                        ]
+                    ),
+                    0,
+                )
+            self.assertIn("equal_to_first=True", display.getvalue())
+            probe_file = next((root / "outputs").glob("*/diagnostics.json"))
+            diagnostic = json.loads(probe_file.read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["probe_position_0based"], 3)
+            self.assertEqual(len(diagnostic["observations"]), 4)
 
 
 if __name__ == "__main__":

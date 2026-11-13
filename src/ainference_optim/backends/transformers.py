@@ -1,6 +1,7 @@
 """单设备、batch=1 的 Transformers 贪心基线；第三方张量仅在此模块使用。"""
 
 import gc
+import hashlib
 import importlib
 import inspect
 import os
@@ -12,7 +13,7 @@ from types import ModuleType
 from typing import Any
 
 from ainference_optim.config import TransformersConfig
-from ainference_optim.domain import BackendInfo, GenerationRequest, GenerationResult
+from ainference_optim.domain import BackendInfo, GenerationRequest, GenerationResult, LogitProbe
 
 
 def _configure_fp32(torch: ModuleType) -> None:
@@ -336,6 +337,119 @@ class TransformersBackend:
                 **self._forward_options,
             )
             return tuple(int(token) for token in result[0, length:].tolist())
+
+    def _probe_forward(self, inputs: dict[str, Any], prefix: Any, cached: bool) -> Any:
+        torch = self._torch
+        input_ids = inputs["input_ids"]
+        attention = inputs["attention_mask"]
+        if not cached:
+            input_ids = torch.cat((input_ids, prefix), dim=-1)
+            attention = torch.cat((attention, attention.new_ones(prefix.shape)), dim=-1)
+            prepared = self._model.prepare_inputs_for_generation(
+                input_ids,
+                attention_mask=attention,
+                use_cache=False,
+                cache_position=torch.arange(input_ids.shape[-1], device=self._device),
+                **self._forward_options,
+            )
+            return self._model(**prepared, return_dict=True).logits[:, -1, :]
+        cache = self._hf.DynamicCache(config=self._model.config)
+        position = torch.arange(input_ids.shape[-1], device=self._device)
+        for index in range(prefix.shape[-1] + 1):
+            prepared = self._model.prepare_inputs_for_generation(
+                input_ids,
+                attention_mask=attention,
+                past_key_values=cache,
+                cache_position=position,
+                use_cache=True,
+                **self._forward_options,
+            )
+            output = self._model(**prepared, return_dict=True)
+            if index == prefix.shape[-1]:
+                return output.logits[:, -1, :]
+            cache = output.past_key_values
+            if cache is None:
+                raise RuntimeError("诊断模型未返回 KV Cache")
+            input_ids = prefix[:, index : index + 1]
+            attention = torch.cat((attention, attention.new_ones((1, 1))), dim=-1)
+            position = position[-1:] + 1
+        raise RuntimeError("前缀重放未产生 logits")
+
+    def probe_logits(
+        self, request: GenerationRequest, prefix: tuple[int, ...], repeats: int
+    ) -> tuple[LogitProbe, ...]:
+        """固定前缀，重复观测全上下文和逐步缓存计算的末位原始 logits。
+
+        Args:
+            request: 提供原始输入和种子，不进行随机采样。
+            prefix: 已选定的共同输出前缀，重放时不根据本次 argmax 改动它。
+            repeats: 每条计算路径重复次数，至少为 2。
+
+        Returns:
+            按路径和轮次排列的 top-5、非有限值、原始值哈希与重复差异。
+
+        Raises:
+            ValueError: 次数、token ID 或上下文长度不合法。
+            RuntimeError: 模型处于训练模式或后端已经关闭。
+        """
+        self._ensure_open()
+        if repeats < 2 or len(prefix) >= request.max_new_tokens:
+            raise ValueError("探针要求 repeats≥2 且前缀短于输出上限")
+        if any(
+            type(token) is not int or not 0 <= token < self._model.config.vocab_size
+            for token in prefix
+        ):
+            raise ValueError("诊断前缀包含非法 token ID")
+        if any(module.training for module in self._model.modules()):
+            raise RuntimeError("诊断要求模型及所有子模块处于 eval 模式")
+        torch = self._torch
+        observations: list[LogitProbe] = []
+        with self._execution_context():
+            inputs = self._prepare(request)
+            tokens = torch.tensor([prefix], dtype=torch.long, device=self._device)
+            for cached in (False, True):
+                baseline = None
+                for repeat in range(repeats):
+                    torch.manual_seed(request.seed)
+                    self._synchronize()
+                    # 同一个输入 tensor 重复使用，去除文本生成分叉和分词差异。
+                    logits = (
+                        self._probe_forward(inputs, tokens, cached).detach().float().cpu().clone()
+                    )
+                    finite = bool(torch.isfinite(logits).all().item())
+                    if baseline is None:
+                        baseline = logits.clone()
+                    values, ids = logits[0].topk(min(5, logits.shape[-1]))
+                    scores = tuple(
+                        float(value) if torch.isfinite(value).item() else None for value in values
+                    )
+                    difference = logits - baseline
+                    valid_difference = finite and bool(torch.isfinite(baseline).all().item())
+                    observations.append(
+                        LogitProbe(
+                            path="cache_replay" if cached else "full_context_no_cache",
+                            repeat=repeat,
+                            finite=finite,
+                            nonfinite_count=int((~torch.isfinite(logits)).sum().item()),
+                            top_token_ids=tuple(int(token) for token in ids.tolist()),
+                            top_logits=scores,
+                            top_margin=(
+                                scores[0] - scores[1]
+                                if len(scores) >= 2
+                                and scores[0] is not None
+                                and scores[1] is not None
+                                else None
+                            ),
+                            digest=hashlib.sha256(logits.numpy().tobytes()).hexdigest(),
+                            equal_to_first=bool(torch.equal(logits, baseline)),
+                            max_abs_difference=(
+                                float(difference.abs().max().item()) if valid_difference else None
+                            ),
+                            # topk 对并列项的顺序不保证与生成使用的 argmax 一致。
+                            greedy_token_id=int(logits.argmax(dim=-1).item()),
+                        )
+                    )
+        return tuple(observations)
 
     def close(self) -> None:
         """释放本实例持有的模型与分词器；重复关闭无副作用。"""
