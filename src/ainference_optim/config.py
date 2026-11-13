@@ -20,6 +20,8 @@ class TransformersConfig:
     stop_on_eos: bool = True
     local_files_only: bool = False
     max_input_tokens: int = 2048
+    deterministic: bool = False
+    sdpa_backend: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,8 @@ def _transformers_config(raw: dict[str, Any], base: Path) -> TransformersConfig:
         "stop_on_eos",
         "local_files_only",
         "max_input_tokens",
+        "deterministic",
+        "sdpa_backend",
     }
     if set(raw) - allowed or "model" not in raw:
         raise ValueError("transformers 后端必须指定 model，且不能有未知字段")
@@ -82,6 +86,7 @@ def _transformers_config(raw: dict[str, Any], base: Path) -> TransformersConfig:
     device = _string(raw.get("device", "cuda:0"), "backend.device")
     dtype = _string(raw.get("dtype", "bfloat16"), "backend.dtype")
     attention = _string(raw.get("attention", "sdpa"), "backend.attention")
+    sdpa_backend = _string(raw.get("sdpa_backend", "auto"), "backend.sdpa_backend")
     if device != "cpu" and not re.fullmatch(r"cuda:[0-9]+", device):
         raise ValueError("device 仅支持 cpu 或 cuda:<非负索引>，不支持自动分配")
     if dtype not in {"float32", "float16", "bfloat16"}:
@@ -90,6 +95,8 @@ def _transformers_config(raw: dict[str, Any], base: Path) -> TransformersConfig:
         raise ValueError("CPU 功能测试必须使用 float32")
     if attention not in {"sdpa", "eager"}:
         raise ValueError("attention 仅支持 sdpa 或 eager")
+    if sdpa_backend not in {"auto", "math"} or (attention != "sdpa" and sdpa_backend != "auto"):
+        raise ValueError("sdpa_backend 仅支持 auto/math；math 要求 attention=sdpa")
     return TransformersConfig(
         model=model,
         revision=_string(raw.get("revision", "main"), "backend.revision"),
@@ -100,6 +107,8 @@ def _transformers_config(raw: dict[str, Any], base: Path) -> TransformersConfig:
         stop_on_eos=_boolean(raw.get("stop_on_eos", True), "stop_on_eos"),
         local_files_only=_boolean(raw.get("local_files_only", False), "local_files_only"),
         max_input_tokens=_integer(raw.get("max_input_tokens", 2048), "max_input_tokens", 1),
+        deterministic=_boolean(raw.get("deterministic", False), "deterministic"),
+        sdpa_backend=sdpa_backend,
     )
 
 

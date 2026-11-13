@@ -21,19 +21,20 @@ def main(argv: list[str] | None = None) -> int:
     verify = commands.add_parser("verify", help="核对普通解码与参考 generate 的输出 token")
     verify.add_argument("--config", type=Path, required=True)
     verify.add_argument("--samples", type=int, default=3)
+    verify.add_argument("--repeats", type=int, default=1, help="同输入同种子的稳定性重复次数")
     report = commands.add_parser("summarize", help="查看已完成实验的汇总")
     report.add_argument("run_dir", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command in {"run", "verify"}:
-            if args.command == "verify" and args.samples < 1:
-                raise ValueError("--samples 必须大于零")
+            if args.command == "verify" and (args.samples < 1 or args.repeats < 1):
+                raise ValueError("--samples 和 --repeats 必须大于零")
             config = load_config(args.config)
             # 在加载权重或占用 GPU 之前发现数据集格式错误。
             load_prompts(config.dataset)
             backend = create_backend(config.backend, config.transformers)
             if args.command == "verify":
-                output, passed = verify_backend(config, backend, args.samples)
+                output, passed = verify_backend(config, backend, args.samples, args.repeats)
                 print(f"验证报告：{output}；token 一致性：{'通过' if passed else '失败'}")
                 return 0 if passed else 2
             else:

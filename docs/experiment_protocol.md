@@ -79,7 +79,18 @@ verify 命令调用参考 generate，独立保存 verification.json，不加入�
 报告兼容新增 actual_length、reference_length、first_mismatch_index；索引从 0 起，
 完全一致时为 null，长度不同且较短序列为共同前缀时指向首个缺失位置。
 32-token 验证通过不代表 128-token 验证必然通过，晚期分叉仍判为失败，不使用容差放宽。
+verify --repeats R 将每条输入以相同 seed 重复 R 次，默认 1；报告保留所有轮次，
+兼容新增 verification_repeats、repeat（从 0 起）、actual_repeat_match 和 reference_repeat_match。
+passed 要求所有轮次跨路径相同，且各自与第一轮相同，不能让两条路径一起漂移而误判通过。
 synthetic 只表示数据是否由模拟产生：真实计算为 false，设备验收状态另外记录。
+
+确定性诊断使用显式 deterministic=true、sdpa_backend=math。CUDA 后端在初始化前
+设置或核验 CUBLAS_WORKSPACE_CONFIG，执行期间使用严格确定性算子和 math SDPA。
+执行后恢复进程的确定性与 cuDNN 标志；workspace 留在进程环境中，不尝试在 CUDA 初始化后撤回。
+这不是线程并发隔离机制，当前后端只支持串行调用。模型精度仍为 BF16，但 math SDPA
+按 PyTorch 实现会用 FP32 中间值；这不是默认 auto 内核的性能等价替代。
+metadata 保存这两项设置及实际 workspace；配置快照也完整保存新增字段。
+默认值为 false/auto，不启用额外确定性策略；诊断配置的失败与成功须单独保留。
 
 ## 后端扩展步骤
 

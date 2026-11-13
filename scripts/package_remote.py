@@ -30,6 +30,7 @@ def main() -> None:
             "configs/mock.toml",
             "configs/4090_smoke.toml",
             "configs/4090_baseline.toml",
+            "configs/4090_deterministic.toml",
         )
     ]
     for directory in (root / "src/ainference_optim", root / "tests"):

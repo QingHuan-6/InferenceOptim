@@ -4,13 +4,20 @@ import importlib
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
-from ainference_optim.backends.transformers import TransformersBackend, _configure_fp32
+from ainference_optim.backends.transformers import (
+    TransformersBackend,
+    _configure_fp32,
+    _prepare_cublas_workspace,
+)
 from ainference_optim.cli import main
 from ainference_optim.config import TransformersConfig
 from ainference_optim.domain import GenerationRequest, Prompt
@@ -19,6 +26,30 @@ from ainference_optim.metrics import measure
 HAS_INFERENCE = all(
     importlib.util.find_spec(name) is not None for name in ("torch", "transformers", "tokenizers")
 )
+
+
+class WorkspaceTests(unittest.TestCase):
+    def fake_torch(self, initialized: bool) -> ModuleType:
+        module = ModuleType("test_torch")
+        module.cuda = SimpleNamespace(is_initialized=lambda: initialized)
+        return module
+
+    def test_workspace_defaults_before_init_and_preserves_valid_value(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            _prepare_cublas_workspace(self.fake_torch(False))
+            self.assertEqual(os.environ["CUBLAS_WORKSPACE_CONFIG"], ":4096:8")
+        with patch.dict(os.environ, {"CUBLAS_WORKSPACE_CONFIG": ":16:8"}):
+            _prepare_cublas_workspace(self.fake_torch(True))
+            self.assertEqual(os.environ["CUBLAS_WORKSPACE_CONFIG"], ":16:8")
+
+    def test_workspace_rejects_late_or_invalid_configuration(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(RuntimeError):
+            _prepare_cublas_workspace(self.fake_torch(True))
+        with (
+            patch.dict(os.environ, {"CUBLAS_WORKSPACE_CONFIG": "bad"}),
+            self.assertRaises(ValueError),
+        ):
+            _prepare_cublas_workspace(self.fake_torch(False))
 
 
 @unittest.skipUnless(HAS_INFERENCE, "安装 .[inference] 后运行真实库的 CPU 集成测试")
@@ -125,6 +156,44 @@ class TransformersIntegrationTests(unittest.TestCase):
         self.assertEqual(len(result.token_ids), 128)
         self.assertEqual(result.token_ids, self.backend.reference_tokens(request))
 
+    def test_deterministic_math_repeats_and_restores_runtime_flags(self) -> None:
+        torch = importlib.import_module("torch")
+        previous = (
+            torch.are_deterministic_algorithms_enabled(),
+            torch.is_deterministic_algorithms_warn_only_enabled(),
+            torch.backends.cudnn.benchmark,
+            torch.backends.cudnn.deterministic,
+        )
+        stable = TransformersBackend(replace(self.config, deterministic=True, sdpa_backend="math"))
+        try:
+            with stable._execution_context():
+                self.assertTrue(torch.are_deterministic_algorithms_enabled())
+                self.assertFalse(torch.is_deterministic_algorithms_warn_only_enabled())
+                self.assertFalse(torch.backends.cudnn.benchmark)
+                self.assertTrue(torch.backends.cudnn.deterministic)
+                self.assertTrue(torch.backends.cuda.math_sdp_enabled())
+                self.assertFalse(torch.backends.cuda.flash_sdp_enabled())
+                self.assertFalse(torch.backends.cuda.mem_efficient_sdp_enabled())
+            request = replace(self.request, max_new_tokens=128)
+            actual = stable.generate(request).token_ids
+            self.assertEqual(actual, stable.reference_tokens(request))
+            self.assertEqual(actual, stable.generate(request).token_ids)
+            with (
+                patch.object(stable._model, "generate", side_effect=RuntimeError("injected")),
+                self.assertRaisesRegex(RuntimeError, "injected"),
+            ):
+                stable.reference_tokens(request)
+            current = (
+                torch.are_deterministic_algorithms_enabled(),
+                torch.is_deterministic_algorithms_warn_only_enabled(),
+                torch.backends.cudnn.benchmark,
+                torch.backends.cudnn.deterministic,
+            )
+            self.assertEqual(current, previous)
+            self.assertEqual(stable.info.metadata["sdpa_backend"], "math")
+        finally:
+            stable.close()
+
     def test_forward_positions_and_last_logits_match_reference(self) -> None:
         observations = []
 
@@ -230,7 +299,9 @@ class TransformersIntegrationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with redirect_stdout(io.StringIO()):
-                self.assertEqual(main(["verify", "--config", str(config_path)]), 0)
+                self.assertEqual(
+                    main(["verify", "--config", str(config_path), "--repeats", "2"]), 0
+                )
                 self.assertEqual(main(["run", "--config", str(config_path)]), 0)
             output = next((root / "outputs").glob("*/manifest.json")).parent
             manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
@@ -239,6 +310,10 @@ class TransformersIntegrationTests(unittest.TestCase):
             self.assertFalse(row["synthetic"])
             self.assertEqual(len(row["result"]["token_ids"]), 8)
             self.assertEqual(row["metrics"]["input_tokens"], 4)
+            verification = next((root / "outputs").glob("*/verification.json"))
+            report = json.loads(verification.read_text(encoding="utf-8"))
+            self.assertEqual(report["verification_repeats"], 2)
+            self.assertEqual(len(report["requests"]), 2)
 
 
 if __name__ == "__main__":

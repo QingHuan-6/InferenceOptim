@@ -1,0 +1,25 @@
+# BF16 确定性诊断，不替换默认性能配置；路径相对于此配置文件。
+[experiment]
+name = "qwen15b-4090-deterministic"
+dataset = "../data/smoke.jsonl"
+output_dir = "../outputs"
+warmup = 5
+repeats = 3
+seed = 42
+
+[backend]
+name = "transformers"
+model = "../models/Qwen2.5-1.5B-Instruct"
+revision = "main"
+device = "cuda:0"
+dtype = "bfloat16"
+attention = "sdpa"
+chat_template = true
+stop_on_eos = false
+local_files_only = true
+max_input_tokens = 2048
+deterministic = true
+sdpa_backend = "math"
+
+[generation]
+max_new_tokens = 128

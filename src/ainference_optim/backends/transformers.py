@@ -3,7 +3,10 @@
 import gc
 import importlib
 import inspect
+import os
 import subprocess
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from time import perf_counter
 from types import ModuleType
 from typing import Any
@@ -15,6 +18,35 @@ from ainference_optim.domain import BackendInfo, GenerationRequest, GenerationRe
 def _configure_fp32(torch: ModuleType) -> None:
     torch.backends.cuda.matmul.fp32_precision = "ieee"
     torch.backends.cudnn.fp32_precision = "ieee"
+
+
+def _prepare_cublas_workspace(torch: ModuleType) -> None:
+    workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    if workspace is None:
+        if torch.cuda.is_initialized():
+            raise RuntimeError("设置 CUBLAS_WORKSPACE_CONFIG 前 CUDA 已初始化，请用全新进程运行")
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    elif workspace not in {":4096:8", ":16:8"}:
+        raise ValueError("确定性模式要求 CUBLAS_WORKSPACE_CONFIG 为 :4096:8 或 :16:8")
+
+
+@contextmanager
+def _deterministic_algorithms(torch: ModuleType) -> Iterator[None]:
+    previous = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+        torch.backends.cudnn.benchmark,
+        torch.backends.cudnn.deterministic,
+    )
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=False)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        yield
+    finally:
+        torch.use_deterministic_algorithms(previous[0], warn_only=previous[1])
+        torch.backends.cudnn.benchmark = previous[2]
+        torch.backends.cudnn.deterministic = previous[3]
 
 
 def _driver_version() -> str:
@@ -58,6 +90,9 @@ class TransformersBackend:
             ) from error
         torch = self._torch
         self._device = torch.device(config.device)
+        if config.deterministic and self._device.type == "cuda":
+            # 必须早于设备检查、模型加载等可能建立 CUDA/cuBLAS 状态的操作。
+            _prepare_cublas_workspace(torch)
         if self._device.type == "cuda":
             if not torch.cuda.is_available() or self._device.index >= torch.cuda.device_count():
                 raise RuntimeError(f"指定 CUDA 设备不可用：{config.device}")
@@ -121,6 +156,17 @@ class TransformersBackend:
             "input_preparation": "model.prepare_inputs_for_generation",
             "logits_to_keep": str(self._forward_options.get("logits_to_keep", "model_default")),
             "fp32_matmul_precision": "ieee" if self._device.type == "cuda" else "unchanged",
+            "deterministic_requested": str(config.deterministic),
+            "deterministic_algorithms": str(
+                config.deterministic or torch.are_deterministic_algorithms_enabled()
+            ),
+            "deterministic_warn_only": str(
+                False
+                if config.deterministic
+                else torch.is_deterministic_algorithms_warn_only_enabled()
+            ),
+            "sdpa_backend": config.sdpa_backend,
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG", "unset"),
         }
         if self._device.type == "cuda":
             properties = torch.cuda.get_device_properties(self._device)
@@ -154,6 +200,17 @@ class TransformersBackend:
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("后端已关闭，不能再次生成")
+
+    @contextmanager
+    def _execution_context(self) -> Iterator[None]:
+        with ExitStack() as stack:
+            stack.enter_context(self._torch.inference_mode())
+            if self._config.deterministic:
+                stack.enter_context(_deterministic_algorithms(self._torch))
+            if self._config.sdpa_backend == "math":
+                attention = importlib.import_module("torch.nn.attention")
+                stack.enter_context(attention.sdpa_kernel(attention.SDPBackend.MATH))
+            yield
 
     def _synchronize(self) -> None:
         if self._device.type == "cuda":
@@ -203,7 +260,7 @@ class TransformersBackend:
         started = perf_counter()
         token_ids: list[int] = []
         times: list[float] = []
-        with torch.inference_mode():
+        with self._execution_context():
             inputs = self._prepare(request)
             input_tokens = int(inputs["input_ids"].shape[-1])
             current = inputs["input_ids"]
@@ -257,7 +314,7 @@ class TransformersBackend:
         """用独立 GenerationConfig 调用库内 generate，排除模型默认采样与惩罚参数。"""
         self._ensure_open()
         self._torch.manual_seed(request.seed)
-        with self._torch.inference_mode():
+        with self._execution_context():
             inputs = self._prepare(request)
             length = int(inputs["input_ids"].shape[-1])
             generation = self._hf.GenerationConfig(

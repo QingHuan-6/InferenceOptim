@@ -332,6 +332,28 @@ smoke 最多生成 32 token、遇 EOS 停止；baseline 预热 5 次、正式重
 忽略 EOS 并固定输出 128 token，仅用于性能测量。
 verify 只核对所选贪心请求的 token 序列，不证明任务准确率或采样分布等价。
 
+### 重复运行不稳定时的确定性诊断
+
+若同一 seed 下手写或参考路径各自重复也不一致，先在全新 Python 进程运行：
+
+```bash
+.venv-4090/bin/python -m ainference_optim verify \
+  --config configs/4090_deterministic.toml --samples 3 --repeats 3
+```
+
+该预设直接读取项目 models/Qwen2.5-1.5B-Instruct，无需编辑已有服务器配置；
+若模型另存别处，复制后修改 model，并修正相对数据/输出路径。
+它保持 BF16，显式设置 deterministic=true 和 sdpa_backend="math"，
+在 CUDA 初始化前设置 cuBLAS workspace，并以严格模式拒绝已知非确定性算子。
+每条提示使用同一个 seed 重复，必须同时满足两条路径互相一致、各自重复一致。
+此处 --repeats 属于 verify，与实验配置中性能重复次数独立，默认值为 1。
+
+默认配置仍为 deterministic=false、sdpa_backend="auto"，不静默改变已有实验。
+math 内核和严格确定性可能改变速度、内存及输出；诊断通过不证明默认内核已稳定，
+两种配置不得混为同一个性能对照。不同软件/设备上的位级一致也不受此开关保证。
+依据：[PyTorch 可复现性](https://docs.pytorch.org/docs/2.9/notes/randomness.html)、
+[SDPA 内核选择](https://docs.pytorch.org/docs/2.9/generated/torch.nn.functional.scaled_dot_product_attention.html)。
+
 ## 本地无 GPU 快速开始
 
 需要 Python 3.11 或以上。mock 核心运行不依赖 PyTorch 或任何第三方包。

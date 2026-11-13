@@ -73,6 +73,9 @@ smoke 最多检查 32 token，baseline 检查 128 token；后续位置发生分�
 查看 verification.json 中每条请求的 actual/reference、长度和 first_mismatch_index（从 0 起），
 并保留模型来源、torch/transformers 版本、精度和 attention 设置。
 TF32 旧接口警告与 token 不一致是不同问题，去掉警告本身不证明正确性已恢复。
+若两条路径各自重复运行也不稳定，先使用 README 中的 configs/4090_deterministic.toml
+和 verify --repeats 3 做确定性诊断。该配置保持 BF16，显式选择严格确定性与 math SDPA，
+其成功或性能不能直接推广到默认 auto 配置。
 
 当前修订对齐了手写与参考路径的输入准备、DynamicCache 和末位 logits 投影，并替换 TF32 API。
 CPU 随机小模型的 128-token 检查不能代替目标机器验收；需要用原 BF16/SDPA 配置重新 verify。
