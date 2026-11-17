@@ -15,6 +15,7 @@ from typing import Any
 from ainference_optim.config import TransformersConfig
 from ainference_optim.domain import (
     BackendInfo,
+    DraftCounts,
     GenerationRequest,
     GenerationResult,
     LogitProbe,
@@ -49,18 +50,67 @@ class _TokenClock:
         self.ended = True
 
 
+class _DraftPolicy:
+    """请求级自适应策略及草稿计数。"""
+
+    def __init__(self, limit: int, adaptive: bool) -> None:
+        self.limit = limit
+        self.adaptive = adaptive
+        self.length = limit
+        self.proposed = self.accepted = self.skipped = 0
+        self.misses = self.cooldown = 0
+
+    def observe(self, proposed: int, accepted: int) -> None:
+        self.proposed += proposed
+        self.accepted += accepted
+        if not self.adaptive or self.cooldown:
+            return
+        self.misses = 0 if accepted else self.misses + 1
+        if self.misses == 2:
+            self.cooldown = 2
+            self.misses = 0
+        if proposed:
+            if accepted == proposed:
+                self.length = min(self.limit, self.length + 1)
+            else:
+                self.length = max(1, self.length // 2)
+
+
 class _BoundedLookupCandidates:
     """仅裁剪候选以给目标模型的额外 token 留位置，验证与缓存仍由 HF 管理。"""
 
-    def __init__(self, delegate: Any, max_length: int) -> None:
+    def __init__(self, delegate: Any, max_length: int, policy: _DraftPolicy | None) -> None:
         self._delegate = delegate
         self._max_length = max_length
+        self._policy = policy
+        self._prefix_length = self._proposed = 0
+        self._skip = False
 
     def get_candidates(self, input_ids: Any) -> tuple[Any, Any]:
+        policy = self._policy
+        self._prefix_length = input_ids.shape[-1]
+        self._skip = bool(policy and policy.cooldown and self._prefix_length < self._max_length - 1)
+        if self._skip:
+            self._proposed = 0
+            return input_ids, None
+        if policy is not None:
+            self._delegate.num_output_tokens = policy.length
         candidates, logits = self._delegate.get_candidates(input_ids)
-        return candidates[:, : self._max_length - 1], logits
+        candidates = candidates[:, : self._max_length - 1]
+        self._proposed = candidates.shape[-1] - self._prefix_length
+        return candidates, logits
 
     def update_candidate_strategy(self, input_ids: Any, scores: Any, num_matches: Any) -> None:
+        policy = self._policy
+        if policy is not None:
+            if self._skip:
+                policy.cooldown -= 1
+                policy.skipped += 1
+            elif self._prefix_length < self._max_length - 1:
+                # 此路径禁用 EOS，且始终为目标 token 留一位。
+                # 从形状减掉目标模型额外生成的 1 token，避免读取 CUDA 标量。
+                accepted = input_ids.shape[-1] - self._prefix_length - 1
+                policy.observe(self._proposed, accepted)
         self._delegate.update_candidate_strategy(input_ids, scores, num_matches)
 
 
@@ -374,6 +424,7 @@ class TransformersBackend:
         inputs: dict[str, Any],
         streamer: _TokenClock | None = None,
         draft_tokens: int = 0,
+        policy: _DraftPolicy | None = None,
     ) -> Any:
         # HF 4.57.1 的 PromptLookup 在命中候选时无条件调用 isin(eos)。
         # 空列表表达“无 EOS 停止”，同时避免 None 导致第三方实现报错。
@@ -396,7 +447,7 @@ class TransformersBackend:
         )
         # 显式覆盖 EOS，避免 HF 将模型默认停止条件重新合并进来。
         with self._bounded_lookup_candidates(
-            int(inputs["input_ids"].shape[-1]) + request.max_new_tokens, draft_tokens > 0
+            int(inputs["input_ids"].shape[-1]) + request.max_new_tokens, draft_tokens > 0, policy
         ):
             return self._model.generate(
                 **inputs,
@@ -408,7 +459,9 @@ class TransformersBackend:
             )
 
     @contextmanager
-    def _bounded_lookup_candidates(self, max_length: int, enabled: bool) -> Iterator[None]:
+    def _bounded_lookup_candidates(
+        self, max_length: int, enabled: bool, policy: _DraftPolicy | None
+    ) -> Iterator[None]:
         if not enabled:
             yield
             return
@@ -419,7 +472,7 @@ class TransformersBackend:
         previous = model.__dict__.get("_get_candidate_generator")
 
         def bounded(*args: Any, **kwargs: Any) -> _BoundedLookupCandidates:
-            return _BoundedLookupCandidates(factory(*args, **kwargs), max_length)
+            return _BoundedLookupCandidates(factory(*args, **kwargs), max_length, policy)
 
         model._get_candidate_generator = bounded
         try:
@@ -491,8 +544,32 @@ class TransformersBackend:
             raise ValueError("投机小试验要求固定长度 hf_generate")
         return self._timed_native(request, False, draft_tokens)
 
+    def speculation_timing(
+        self, request: GenerationRequest, draft_tokens: int, *, adaptive: bool
+    ) -> NativeTiming:
+        """执行正式对照的一次固定长度生成。
+
+        Args:
+            request: 固定输入、随机种子和输出预算。
+            draft_tokens: 草稿长度上限；0 调用普通贪心生成。
+            adaptive: 是否按接受表现调整长度并临时跳过候选查找。
+
+        Returns:
+            同步生成墙钟时间、输出、峰值显存及投机路径的候选计数。
+        """
+        if not 0 <= draft_tokens <= 16 or (adaptive and draft_tokens == 0):
+            raise ValueError("草稿上限必须为0–16，自适应要求正上限")
+        if self._config.generation_path != "hf_generate" or self._config.stop_on_eos:
+            raise ValueError("正式投机实验要求固定长度 hf_generate")
+        policy = _DraftPolicy(draft_tokens, adaptive) if draft_tokens else None
+        return self._timed_native(request, False, draft_tokens, policy)
+
     def _timed_native(
-        self, request: GenerationRequest, streamer: bool, draft_tokens: int
+        self,
+        request: GenerationRequest,
+        streamer: bool,
+        draft_tokens: int,
+        policy: _DraftPolicy | None = None,
     ) -> NativeTiming:
         self._ensure_open()
         self._torch.manual_seed(request.seed)
@@ -506,7 +583,7 @@ class TransformersBackend:
             clock = _TokenClock(started, prompt_ids) if streamer else None
             self._synchronize()
             generation_started = perf_counter()
-            result = self._native_forward(request, inputs, clock, draft_tokens)
+            result = self._native_forward(request, inputs, clock, draft_tokens, policy)
             self._synchronize()
             generation_elapsed = perf_counter() - generation_started
             ids = tuple(int(token) for token in result[0, len(prompt_ids) :].tolist())
@@ -520,7 +597,8 @@ class TransformersBackend:
             if self._device.type == "cuda"
             else None
         )
-        return NativeTiming(generation_elapsed, elapsed, len(prompt_ids), ids, memory)
+        counts = DraftCounts(policy.proposed, policy.accepted, policy.skipped) if policy else None
+        return NativeTiming(generation_elapsed, elapsed, len(prompt_ids), ids, memory, counts)
 
     def reference_tokens(self, request: GenerationRequest) -> tuple[int, ...]:
         """用独立 GenerationConfig 调用库内 generate，排除模型默认采样与惩罚参数。"""

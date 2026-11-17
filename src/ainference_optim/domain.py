@@ -92,6 +92,15 @@ class ReferenceBackend(Backend, Protocol):
 
 
 @dataclass(frozen=True)
+class DraftCounts:
+    """一次请求内的候选、接受和主动跳过查找计数。"""
+
+    proposed: int
+    accepted: int
+    skipped_rounds: int
+
+
+@dataclass(frozen=True)
 class NativeTiming:
     """原生生成的整体耗时观测；不推算未测得的 TTFT 或逐 token 时间。"""
 
@@ -100,6 +109,7 @@ class NativeTiming:
     input_tokens: int
     token_ids: tuple[int, ...]
     peak_memory_bytes: int | None = None
+    draft_counts: DraftCounts | None = None
 
 
 @runtime_checkable
@@ -108,6 +118,17 @@ class LookupTimingBackend(Backend, Protocol):
 
     def lookup_timing(self, request: GenerationRequest, draft_tokens: int) -> NativeTiming:
         """draft_tokens=0 为普通解码，正整数启用 HF 内置提示查找。"""
+        ...
+
+
+@runtime_checkable
+class SpeculationTimingBackend(Backend, Protocol):
+    """支持正式的普通、固定草稿与自适应草稿三路对照。"""
+
+    def speculation_timing(
+        self, request: GenerationRequest, draft_tokens: int, *, adaptive: bool
+    ) -> NativeTiming:
+        """执行一次固定长度生成，投机路径额外返回草稿计数。"""
         ...
 
 

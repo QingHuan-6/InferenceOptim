@@ -14,7 +14,12 @@ from ainference_optim.diagnostics import diagnose_backend
 from ainference_optim.domain import RunProgress
 from ainference_optim.preparation import prepare_baseline_data
 from ainference_optim.runner import run_experiment
-from ainference_optim.speculation import run_speculation_pilot, validate_pilot
+from ainference_optim.speculation import (
+    run_speculation_benchmark,
+    run_speculation_pilot,
+    validate_pilot,
+    validate_speculation,
+)
 from ainference_optim.timing_overhead import measure_timing_overhead
 from ainference_optim.verification import verify_backend
 
@@ -51,6 +56,10 @@ def main(argv: list[str] | None = None) -> int:
     pilot.add_argument("--repeats", type=int, default=2)
     pilot.add_argument("--draft-tokens", type=int, default=4)
     pilot.add_argument("--quiet", action="store_true")
+    benchmark = commands.add_parser("speculation-benchmark", help="运行三路正式投机解码对照")
+    benchmark.add_argument("--config", type=Path, required=True)
+    benchmark.add_argument("--draft-tokens", type=int, default=4)
+    benchmark.add_argument("--quiet", action="store_true")
     overhead = commands.add_parser(
         "timing-overhead", help="交错比较原生生成有/无逐 token 回调的耗时"
     )
@@ -97,12 +106,15 @@ def main(argv: list[str] | None = None) -> int:
                 print("注意：这是合成计时对比，不代表真实性能。")
             print(json.dumps(summary["by_scenario"], ensure_ascii=False, indent=2))
             return 0
-        if args.command in {"run", "verify", "diagnose", "timing-overhead", "speculation-pilot"}:
+        progress_commands = {"run", "timing-overhead", "speculation-pilot", "speculation-benchmark"}
+        if args.command in progress_commands | {"verify", "diagnose"}:
             if args.command == "verify" and (args.samples < 1 or args.repeats < 1):
                 raise ValueError("--samples 和 --repeats 必须大于零")
             config = load_config(args.config)
             if args.command == "speculation-pilot":
                 validate_pilot(config, args.samples, args.repeats, args.draft_tokens)
+            elif args.command == "speculation-benchmark":
+                validate_speculation(config, args.draft_tokens)
             if args.command == "timing-overhead" and (
                 args.samples < 1
                 or args.repeats < 2
@@ -123,13 +135,17 @@ def main(argv: list[str] | None = None) -> int:
                     )
             # 在加载权重或占用 GPU 之前发现数据集格式错误。
             load_prompts(config.dataset)
-            show_progress = (
-                args.command in {"run", "timing-overhead", "speculation-pilot"} and not args.quiet
-            )
+            show_progress = args.command in progress_commands and not args.quiet
             if show_progress:
                 print("正在加载后端/模型，加载耗时不计入请求测量……", file=sys.stderr, flush=True)
             backend = create_backend(config.backend, config.transformers)
-            if args.command == "speculation-pilot":
+            if args.command == "speculation-benchmark":
+                output = run_speculation_benchmark(
+                    config, backend, args.draft_tokens, _print_progress if show_progress else None
+                )
+                print(f"正式实验目录：{output}")
+                print((output / "table.md").read_text(encoding="utf-8"), end="")
+            elif args.command == "speculation-pilot":
                 output = run_speculation_pilot(
                     config,
                     backend,

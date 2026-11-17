@@ -19,7 +19,7 @@ from ainference_optim.backends.transformers import (
     _prepare_cublas_workspace,
 )
 from ainference_optim.cli import main
-from ainference_optim.config import TransformersConfig
+from ainference_optim.config import ExperimentConfig, TransformersConfig
 from ainference_optim.domain import GenerationRequest, Prompt
 from ainference_optim.metrics import measure
 
@@ -212,6 +212,48 @@ class TransformersIntegrationTests(unittest.TestCase):
         ):
             self.backend.lookup_timing(self.request, 4)
         self.assertNotIn("_get_candidate_generator", self.backend._model.__dict__)
+
+    def test_formal_speculation_cli_runs_all_methods_and_writes_table(self) -> None:
+        config = replace(self.config, generation_path="hf_generate")
+        self.backend._config = config
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "input.jsonl"
+            prompts = ["hello world assistant hello world", "world hello"]
+            dataset.write_text(
+                "\n".join(
+                    json.dumps({"id": str(i), "scenario": "chat", "prompt": prompt})
+                    for i, prompt in enumerate(prompts)
+                ),
+                encoding="utf-8",
+            )
+            experiment = ExperimentConfig(
+                "formal", dataset, root, 1, 2, 42, "transformers", 32, config
+            )
+            with (
+                patch("ainference_optim.cli.load_config", return_value=experiment),
+                patch("ainference_optim.cli.create_backend", return_value=self.backend),
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                code = main(["speculation-benchmark", "--config", "unused", "--quiet"])
+            self.assertEqual(code, 0)
+            self.assertIn("固定草稿", output.getvalue())
+            result = next(root.glob("formal-speculation-*"))
+            manifest = json.loads((result / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "completed")
+            self.assertEqual(manifest["completed_groups"], 4)
+            self.assertGreater(manifest["summary"]["fixed"]["draft_proposed"], 0)
+            self.assertGreater(manifest["summary"]["adaptive"]["skipped_lookup_rounds"], 0)
+            self.assertEqual(manifest["summary"]["plain"]["speedup_95ci"], [1.0, 1.0])
+            pairs = [json.loads(line) for line in (result / "pairs.jsonl").read_text().splitlines()]
+            self.assertEqual(
+                [row["order"][0] for row in pairs], ["plain", "fixed", "fixed", "adaptive"]
+            )
+            for row in pairs:
+                for method in ("fixed", "adaptive"):
+                    self.assertEqual(row[method]["token_ids"], row["plain"]["token_ids"])
+                    counts = row[method]["draft_counts"]
+                    self.assertLessEqual(counts["accepted"], counts["proposed"])
 
     def test_prompt_lookup_candidate_and_multitoken_verification(self) -> None:
         hf_candidates = importlib.import_module("transformers.generation.candidate_generator")
